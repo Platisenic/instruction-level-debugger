@@ -8,6 +8,7 @@
 #include <sys/user.h>
 #include <string.h>
 #include <elf.h>
+#include <ctype.h>
 
 #include <map>
 #include <string>
@@ -82,11 +83,50 @@ bool contTracee(pid_t child, State &state) {
         return false;
     }
     int wait_status;
-    ptrace(PTRACE_CONT, child, 0, 0);
+    if(ptrace(PTRACE_CONT, child, 0, 0) < 0) {
+        perror("** cont");
+        return false;
+    }
     waitpid(child, &wait_status, 0);
     if (WIFEXITED(wait_status)) {
         printf("** child process %d terminiated normally (code %d)\n",
             child, WEXITSTATUS(wait_status));
+        state = State::LOADED;
+    } else if (WIFSTOPPED(wait_status)) {
+        // do something
+    }
+    return true;
+}
+
+bool runTracee(char *progName, pid_t child, State &state) {
+    if (state == State::NOT_LOADED) {
+        printf("** state must be LOADED or RUNNING\n");
+        return false;
+    }
+    if (state == State::LOADED) {
+        child = startTracee(progName, state);
+    }
+    if (state == State::RUNNING) {
+        contTracee(child, state);
+    }
+    return true;
+}
+
+bool stepTracee(pid_t child, State &state) {
+    if (state != State::RUNNING) {
+        printf("** state must be RUNNING\n");
+        return false;
+    }
+    int wait_status;
+    if(ptrace(PTRACE_SINGLESTEP, child, 0, 0) < 0) {
+        perror("** singlestep");
+        return false;
+    }
+    waitpid(child, &wait_status, 0);
+    if (WIFEXITED(wait_status)) {
+        printf("** child process %d terminiated normally (code %d)\n",
+            child, WEXITSTATUS(wait_status));
+        state = State::LOADED;
     } else if (WIFSTOPPED(wait_status)) {
         // do something
     }
@@ -94,12 +134,12 @@ bool contTracee(pid_t child, State &state) {
 }
 
 bool loadProgram(int nargs, char **args, State &state, char *progName) {
-    if (state != State::NOT_LOADED) {
-        printf("** state must be NOT LOADED\n");
-        return false;
-    }
     if (nargs < 2) {
         printf("** no program path is given\n");
+        return false;
+    }
+    if (state != State::NOT_LOADED) {
+        printf("** state must be NOT LOADED\n");
         return false;
     }
     Elf64_Ehdr header;
@@ -121,7 +161,7 @@ bool loadProgram(int nargs, char **args, State &state, char *progName) {
     return true;
 }
 
-bool printRegs(pid_t child, State &state) {
+bool getRegs(pid_t child, State &state) {
     if (state != State::RUNNING) {
         printf("** state must be RUNNING\n");
         return false;
@@ -144,7 +184,11 @@ bool printRegs(pid_t child, State &state) {
     return true;
 }
 
-bool printSingleReg(pid_t child, State &state, char *regName) {
+bool getSingleReg(int nargs, pid_t child, State &state, char *regName) {
+    if (nargs < 2) {
+        printf("** no register is given\n");
+        return false;
+    }
     if (state != State::RUNNING) {
         printf("** state must be RUNNING\n");
         return false;
@@ -161,9 +205,82 @@ bool printSingleReg(pid_t child, State &state, char *regName) {
     return true;
 }
 
-char * getCmd(char *cmd) {
+bool setSingleTreg(int nargs, pid_t child, State &state, char *regName, char *regValptr) {
+    if (nargs < 3) {
+        printf("** Not enough input arguments\n");
+        return false;
+    }
+    if (state != State::RUNNING) {
+        printf("** state must be RUNNING\n");
+        return false;
+    }
+    std::string regkey(regName);
+    auto iter = regoffsets.find(regkey);
+    if (iter == regoffsets.end()) {
+        printf("** undefined register\n");
+        return false;
+    }
+    unsigned long long regVal = strtoull(regValptr, NULL, 16);
+    if (ptrace(PTRACE_POKEUSER, child, iter->second, regVal) < 0) {
+        perror("** pokeuser");
+        return false;
+    }
+    return true;
+}
+
+bool dumpMemory(int nargs, pid_t child, State &state, char *address) {
+    if (nargs < 2) {
+        printf("** no addr is given\n");
+        return false;
+    }
+    if (state != State::RUNNING) {
+        printf("** state must be RUNNING\n");
+        return false;
+    }
+    unsigned long long addressVal = strtoull(address, NULL, 16);
+    long ret;
+    unsigned char *ptr = (unsigned char *) &ret;
+    unsigned char strbuf[17];
+    memset(strbuf, 0, 17);
+
+    for (int i=0;i<10;i++) {
+        if (i%2==0) { printf("      0x%llx:", addressVal + i*8); }
+        ret = ptrace(PTRACE_PEEKTEXT, child, addressVal + i*8, 0);
+        for (int j=0;j<8;j++) {
+            printf(" %2.2x", ptr[j]);
+            strbuf[j + i%2*8] = (isprint(ptr[j]) == 0) ? '.' : ptr[j];
+        }
+        if (i%2==1) {
+            printf(" |%s|\n", strbuf);
+        }
+    }
+    return true;
+}
+
+char* getCmd(char *cmd) {
     printf("sdb> ");
     return fgets(cmd, 512, stdin);
+}
+
+void printHelpMsg() {
+    printf(
+        "- break {instruction-address}: add a break point\n"
+        "- cont: continue execution\n"
+        "- delete {break-point-id}: remove a break point\n"
+        "- disasm addr: disassemble instructions in a file or a memory region\n"
+        "- dump addr: dump memory content\n"
+        "- exit: terminate the debugger\n"
+        "- get reg: get a single value from a register\n"
+        "- getregs: show registers\n"
+        "- help: show this message\n"
+        "- list: list break points\n"
+        "- load {path/to/a/program}: load a program\n"
+        "- run: run the program\n"
+        "- vmmap: show memory layout\n"
+        "- set reg val: get a single value to a register\n"
+        "- si: step into instruction\n"
+        "- start: start the program and stop at the first instruction\n"
+    );
 }
 
 
@@ -190,10 +307,20 @@ int main() {
             tracee = startTracee(progName, state);
         } else if ((strcmp("cont", args[0]) == 0) || (strcmp("c", args[0]) == 0)) {
             contTracee(tracee, state);
+        } else if ((strcmp("run", args[0]) == 0) || (strcmp("r", args[0]) == 0)) {
+            runTracee(progName, tracee , state);
+        } else if (strcmp("si", args[0]) == 0) {
+            stepTracee(tracee, state);
         } else if (strcmp("getregs", args[0]) == 0) {
-            printRegs(tracee, state);
+            getRegs(tracee, state);
         } else if ((strcmp("get", args[0]) == 0) || (strcmp("g", args[0]) == 0)) {
-            printSingleReg(tracee, state, args[1]);
+            getSingleReg(nargs, tracee, state, args[1]);
+        } else if ((strcmp("set", args[0]) == 0) || (strcmp("s", args[0]) == 0)) {
+            setSingleTreg(nargs, tracee, state, args[1], args[2]);
+        } else if ((strcmp("help", args[0]) == 0) || (strcmp("h", args[0]) == 0)) {
+            printHelpMsg();
+        } else if ((strcmp("dump", args[0]) == 0) || (strcmp("x", args[0]) == 0)) {
+            dumpMemory(nargs, tracee, state, args[1]);
         } else {
             printf("** undefined command\n");
         }
