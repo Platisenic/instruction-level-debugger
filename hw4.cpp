@@ -44,7 +44,8 @@ std::map<std::string, long int> regoffsets {
     {"flags", ((unsigned char *) &__regs.eflags) - ((unsigned char *) &__regs)},
 };
 
-struct BPinfo{
+class BPinfo {
+public:
     unsigned long address;
     unsigned long oriByte;
     BPinfo():
@@ -55,11 +56,78 @@ struct BPinfo{
     }
 };
 
+class Instruction {
+public:
+    unsigned long address;
+    unsigned char bytes[16];
+    int size;
+    std::string mnemonic;
+    std::string op_str;
+    Instruction(
+        unsigned long address,
+        unsigned char* bytesptr,
+        int size,
+        char *mnemonic,
+        char *op_str
+    ): address(address), size(size), mnemonic(mnemonic), op_str(op_str) {
+        memcpy(bytes, bytesptr, size);
+    }
+};
+
 std::vector<BPinfo> breakpoints;
 unsigned long lastBpAddress = 0;
 
 void exitProcess() {
     exit(0);
+}
+
+void printInstr(std::vector<Instruction> &instrs) {
+    char bytes[128] = "";
+    for (auto it=instrs.begin(); it!=instrs.end(); it++) {
+        for(int i=0; i<it->size; i++) {
+            snprintf(&bytes[i*3], 4, "%02x ", it->bytes[i]);
+        }
+        fprintf(stderr, "%12lx: %-32s\t%-10s%s\n", it->address, bytes, it->mnemonic.c_str(), it->op_str.c_str());
+    }
+}
+
+void disAsmInstr(std::vector<Instruction> &instrs, pid_t pid, unsigned long startAddr, int num)  {
+    char codes[256] = { 0 };
+    unsigned long peek, offset;
+    // peek
+    for (int i=0; i<num*2; i++) {
+        // todo check text ranges
+        errno = 0;
+        peek = ptrace(PTRACE_PEEKTEXT, pid, startAddr+i*8, NULL);
+        if (errno != 0) { break; }
+        memcpy(&codes[i*8], &peek, sizeof(peek));
+        // clear brackpoints
+        for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
+            if ((startAddr+i*8) <= it->address && it->address < (startAddr+i*8+8)) {
+                offset = it->address - (startAddr+i*8);
+                codes[i*8+offset] = it->oriByte;
+            }
+        }
+    }
+    // disassembly
+    csh handle;
+    cs_insn *insn;
+    size_t count;
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) { return; }
+    count = cs_disasm(handle, (uint8_t*)codes, sizeof(codes), startAddr, 0, &insn);
+    if (count > 0) {
+        for (size_t j=0; j<count && j<num; j++) {
+            instrs.push_back(Instruction(
+                insn[j].address,
+                insn[j].bytes,
+                insn[j].size,
+                insn[j].mnemonic,
+                insn[j].op_str
+            ));
+        }
+        cs_free(insn, count);
+    }
+    cs_close(&handle);
 }
 
 pid_t startTracee(char *progName, State &state) {
@@ -103,21 +171,21 @@ pid_t startTracee(char *progName, State &state) {
     return child;
 }
 
-bool stepTracee(pid_t child, State &state) {
+bool stepTracee(pid_t pid, State &state) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     int wait_status;
     unsigned long rip, code;
-    if(ptrace(PTRACE_SINGLESTEP, child, 0, 0) < 0) {
+    if(ptrace(PTRACE_SINGLESTEP, pid, 0, 0) < 0) {
         perror("** singlestep");
         return false;
     }
-    waitpid(child, &wait_status, 0);
+    waitpid(pid, &wait_status, 0);
     if (WIFEXITED(wait_status)) {
         fprintf(stderr, "** child process %d terminiated normally (code %d)\n",
-            child, WEXITSTATUS(wait_status));
+            pid, WEXITSTATUS(wait_status));
         state = State::LOADED;
     } else if (WIFSTOPPED(wait_status)) {
         unsigned long address = lastBpAddress;
@@ -125,147 +193,84 @@ bool stepTracee(pid_t child, State &state) {
             return b.address == address;
         });
         if (it != breakpoints.end()) {
-            code = ptrace(PTRACE_PEEKTEXT, child, it->address, 0);
+            code = ptrace(PTRACE_PEEKTEXT, pid, it->address, 0);
             code = (code & 0xffffffffffffff00) | 0xcc;
-            if (ptrace(PTRACE_POKETEXT, child, it->address, code) != 0) {
+            if (ptrace(PTRACE_POKETEXT, pid, it->address, code) != 0) {
                 perror("** poketest");
                 return false;
             }
         }
         lastBpAddress = 0;
-        rip = ptrace(PTRACE_PEEKUSER, child, regoffsets["rip"], 0);
+        rip = ptrace(PTRACE_PEEKUSER, pid, regoffsets["rip"], 0);
         it = std::find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
             return b.address == (rip - 1);
         });
-        if (it != breakpoints.end()) {
-            code = ptrace(PTRACE_PEEKTEXT, child, it->address, 0);
-            code = (code & 0xffffffffffffff00) | it->oriByte;
-            if (ptrace(PTRACE_POKETEXT, child, it->address, code) != 0) {
-                perror("** poketest");
-                return false;
-            }
-            if (ptrace(PTRACE_POKEUSER, child, regoffsets["rip"], rip - 1) < 0) {
-                perror("** pokeuser");
-                return false;
-            }
-            lastBpAddress = it->address;
-            unsigned long addressVal = it->address;
-            unsigned long peek;
-            unsigned long offset;
-            char codes[16] = { 0 };
-            for (int i=0; i<2; i++) {
-                // check text ranges
-                errno = 0;
-                peek = ptrace(PTRACE_PEEKTEXT, child, addressVal+i*8, NULL);
-                if (errno != 0) { break; }
-                memcpy(&codes[i*8], &peek, sizeof(unsigned long));
-                for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
-                    if ((addressVal+i*8) <= it->address && it->address < (addressVal+i*8+8)) {
-                        offset = it->address - addressVal;
-                        codes[i*8+offset] = it->oriByte;
-                    }
-                }
-            }
-            fprintf(stderr, "** breakpoint @");
-            csh handle;
-            cs_insn *insn;
-            size_t count;
-            if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) { return false; }
-            count = cs_disasm(handle, (uint8_t*)codes, sizeof(codes), addressVal, 0, &insn);
-            if (count > 0) {
-                for (size_t j=0; j<count && j<1; j++) {
-                    fprintf(stderr, "\t%8lx: ", insn[j].address);
-                    for (unsigned short i=0;i<16;i++) {
-                        if (i<insn[j].size) {
-                            fprintf(stderr, "%2.2x ", insn[j].bytes[i]);
-                        }
-                    }
-                    fprintf(stderr, "\t%s\t%s\n", insn[j].mnemonic, insn[j].op_str);
-                }
-                cs_free(insn, count);
-            }
-            cs_close(&handle);
+        if (it == breakpoints.end()) { return true; }
+        // hit breakpoint
+        code = ptrace(PTRACE_PEEKTEXT, pid, it->address, 0);
+        code = (code & 0xffffffffffffff00) | it->oriByte;
+        if (ptrace(PTRACE_POKETEXT, pid, it->address, code) != 0) {
+            perror("** poketest");
+            return false;
         }
+        if (ptrace(PTRACE_POKEUSER, pid, regoffsets["rip"], rip - 1) < 0) {
+            perror("** pokeuser");
+            return false;
+        }
+        lastBpAddress = it->address;
+        std::vector<Instruction> instrs;
+        disAsmInstr(instrs, pid, it->address, 1);
+        fprintf(stderr, "** breakpoint @");
+        printInstr(instrs);
     }
     return true;
 }
 
-bool contTracee(pid_t child, State &state) {
+bool contTracee(pid_t pid, State &state) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     if (lastBpAddress != 0) {
-        stepTracee(child ,state);
+        stepTracee(pid ,state);
         if (lastBpAddress != 0) { // encounter breakpoints in stepTracee
             return true;
         }
     }
     int wait_status;
     unsigned long rip, code;
-    if(ptrace(PTRACE_CONT, child, 0, 0) < 0) {
+    if(ptrace(PTRACE_CONT, pid, 0, 0) < 0) {
         perror("** cont");
         return false;
     }
-    waitpid(child, &wait_status, 0);
+    waitpid(pid, &wait_status, 0);
     if (WIFEXITED(wait_status)) {
         fprintf(stderr, "** child process %d terminiated normally (code %d)\n",
-            child, WEXITSTATUS(wait_status));
+            pid, WEXITSTATUS(wait_status));
         state = State::LOADED;
     } else if (WIFSTOPPED(wait_status)) {
-        rip = ptrace(PTRACE_PEEKUSER, child, regoffsets["rip"], 0);
+        rip = ptrace(PTRACE_PEEKUSER, pid, regoffsets["rip"], 0);
         auto it = std::find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
             return b.address == (rip - 1);
         });
-        if (it != breakpoints.end()) {
-            code = ptrace(PTRACE_PEEKTEXT, child, it->address, 0);
-            code = (code & 0xffffffffffffff00) | it->oriByte;
-            if (ptrace(PTRACE_POKETEXT, child, it->address, code) != 0) {
-                perror("** poketest");
-                return false;
-            }
-            if (ptrace(PTRACE_POKEUSER, child, regoffsets["rip"], rip - 1) < 0) {
-                perror("** pokeuser");
-                return false;
-            }
-            lastBpAddress = it->address;
-            unsigned long addressVal = it->address;
-            unsigned long peek;
-            unsigned long offset;
-            char codes[16] = { 0 };
-            for (int i=0; i<2; i++) {
-                // check text ranges
-                errno = 0;
-                peek = ptrace(PTRACE_PEEKTEXT, child, addressVal+i*8, NULL);
-                if (errno != 0) { break; }
-                memcpy(&codes[i*8], &peek, sizeof(unsigned long));
-                for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
-                    if ((addressVal+i*8) <= it->address && it->address < (addressVal+i*8+8)) {
-                        offset = it->address - addressVal;
-                        codes[i*8+offset] = it->oriByte;
-                    }
-                }
-            }
-            fprintf(stderr, "** breakpoint @");
-            csh handle;
-            cs_insn *insn;
-            size_t count;
-            if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) { return false; }
-            count = cs_disasm(handle, (uint8_t*)codes, sizeof(codes), addressVal, 0, &insn);
-            if (count > 0) {
-                for (size_t j=0; j<count && j<1; j++) {
-                    fprintf(stderr, "\t%8lx: ", insn[j].address);
-                    for (unsigned short i=0;i<16;i++) {
-                        if (i<insn[j].size) {
-                            fprintf(stderr, "%2.2x ", insn[j].bytes[i]);
-                        }
-                    }
-                    fprintf(stderr, "\t%s\t%s\n", insn[j].mnemonic, insn[j].op_str);
-                }
-                cs_free(insn, count);
-            }
-            cs_close(&handle);
+        if (it == breakpoints.end()) { return true; }
+        // hit breakpoint
+        code = ptrace(PTRACE_PEEKTEXT, pid, it->address, 0);
+        code = (code & 0xffffffffffffff00) | it->oriByte;
+        if (ptrace(PTRACE_POKETEXT, pid, it->address, code) != 0) {
+            perror("** poketest");
+            return false;
         }
+        if (ptrace(PTRACE_POKEUSER, pid, regoffsets["rip"], rip - 1) < 0) {
+            perror("** pokeuser");
+            return false;
+        }
+        lastBpAddress = it->address;
+        std::vector<Instruction> instrs;
+        disAsmInstr(instrs, pid, it->address, 1);
+        fprintf(stderr, "** breakpoint @");
+        printInstr(instrs);
+        
     }
     return true;
 }
@@ -502,53 +507,15 @@ bool deleteBrackPoint(int nargs, pid_t child, State &state, char *bpID) {
     return true;
 }
 
-bool disAssembly(int nargs, pid_t child, State &state, char *address) {
-    if (nargs < 2) {
-        fprintf(stderr, "** no addr is given\n");
-        return false;
-    }
+void CMD_disAssembly(pid_t pid, State &state, char *address) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
+        return;
     }
     unsigned long addressVal = strtoul(address, NULL, 16);
-    unsigned long peek;
-    unsigned long offset;
-    char code[160] = { 0 };
-    for (int i=0; i<20; i++) {
-        // check text ranges
-        errno = 0;
-        peek = ptrace(PTRACE_PEEKTEXT, child, addressVal+i*8, NULL);
-        if (errno != 0) { break; }
-        memcpy(&code[i*8], &peek, sizeof(unsigned long));
-        for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
-            if ((addressVal+i*8) <= it->address && it->address < (addressVal+i*8+8)) {
-                offset = it->address - addressVal;
-                code[i*8+offset] = it->oriByte;
-            }
-        }
-    }
-    csh handle;
-    cs_insn *insn;
-    size_t count;
-    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) { return false; }
-    count = cs_disasm(handle, (uint8_t*)code, sizeof(code), addressVal, 0, &insn);
-    if (count > 0) {
-        for (size_t j=0; j<count && j<10; j++) {
-            fprintf(stderr, "\t%lx: ", insn[j].address);
-            for (unsigned short i=0;i<16;i++) {
-                if (i<insn[j].size) {
-                    fprintf(stderr, "%2.2x ", insn[j].bytes[i]);
-                } else {
-                    fprintf(stderr, "   ");
-                }
-            }
-            fprintf(stderr, "%s\t%s\n", insn[j].mnemonic, insn[j].op_str);
-        }
-        cs_free(insn, count);
-    }
-    cs_close(&handle);
-    return true;
+    std::vector<Instruction> instrs;
+    disAsmInstr(instrs, pid, addressVal, 10);
+    printInstr(instrs);
 }
 
 char* getCmd(char *cmd, FILE *filein) {
@@ -664,7 +631,11 @@ int main(int argc, char *argv[]) {
         } else if (strcmp("delete", args[0]) == 0) {
             deleteBrackPoint(nargs, tracee, state, args[1]);
         } else if ((strcmp("disasm", args[0]) == 0) || (strcmp("d", args[0]) == 0)) {
-            disAssembly(nargs, tracee, state, args[1]);
+            if (nargs < 2) {
+                fprintf(stderr, "** no addr is given\n");
+            } else {
+                CMD_disAssembly(tracee, state, args[1]);
+            }
         } else {
             fprintf(stderr, "** undefined command\n");
         }
