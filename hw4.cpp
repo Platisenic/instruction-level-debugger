@@ -9,6 +9,7 @@
 #include <string.h>
 #include <elf.h>
 #include <ctype.h>
+#include <capstone/capstone.h>
 
 #include <map>
 #include <string>
@@ -63,7 +64,7 @@ void exitProcess() {
 
 pid_t startTracee(char *progName, State &state) {
     if (state != State::LOADED) {
-        printf("** state must be LOADED\n");
+        fprintf(stderr, "** state must be LOADED\n");
         return -1;
     }
     char *argv[] = {progName, NULL};
@@ -97,14 +98,14 @@ pid_t startTracee(char *progName, State &state) {
             }
         }
         state = State::RUNNING;
-        printf("** pid %d\n", child);
+        fprintf(stderr, "** pid %d\n", child);
     }
     return child;
 }
 
 bool stepTracee(pid_t child, State &state) {
     if (state != State::RUNNING) {
-        printf("** state must be RUNNING\n");
+        fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     int wait_status;
@@ -115,12 +116,12 @@ bool stepTracee(pid_t child, State &state) {
     }
     waitpid(child, &wait_status, 0);
     if (WIFEXITED(wait_status)) {
-        printf("** child process %d terminiated normally (code %d)\n",
+        fprintf(stderr, "** child process %d terminiated normally (code %d)\n",
             child, WEXITSTATUS(wait_status));
         state = State::LOADED;
     } else if (WIFSTOPPED(wait_status)) {
         unsigned long address = lastBpAddress;
-        auto it = find_if(breakpoints.begin(), breakpoints.end(), [address](const BPinfo &b) {
+        auto it = std::find_if(breakpoints.begin(), breakpoints.end(), [address](const BPinfo &b) {
             return b.address == address;
         });
         if (it != breakpoints.end()) {
@@ -130,10 +131,10 @@ bool stepTracee(pid_t child, State &state) {
                 perror("** poketest");
                 return false;
             }
-            lastBpAddress = 0;
         }
+        lastBpAddress = 0;
         rip = ptrace(PTRACE_PEEKUSER, child, regoffsets["rip"], 0);
-        it = find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
+        it = std::find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
             return b.address == (rip - 1);
         });
         if (it != breakpoints.end()) {
@@ -148,7 +149,42 @@ bool stepTracee(pid_t child, State &state) {
                 return false;
             }
             lastBpAddress = it->address;
-            printf("** breakpoint @\n"); // todo dissasm
+            unsigned long addressVal = it->address;
+            unsigned long peek;
+            unsigned long offset;
+            char codes[16] = { 0 };
+            for (int i=0; i<2; i++) {
+                // check text ranges
+                errno = 0;
+                peek = ptrace(PTRACE_PEEKTEXT, child, addressVal+i*8, NULL);
+                if (errno != 0) { break; }
+                memcpy(&codes[i*8], &peek, sizeof(unsigned long));
+                for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
+                    if ((addressVal+i*8) <= it->address && it->address < (addressVal+i*8+8)) {
+                        offset = it->address - addressVal;
+                        codes[i*8+offset] = it->oriByte;
+                    }
+                }
+            }
+            fprintf(stderr, "** breakpoint @");
+            csh handle;
+            cs_insn *insn;
+            size_t count;
+            if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) { return false; }
+            count = cs_disasm(handle, (uint8_t*)codes, sizeof(codes), addressVal, 0, &insn);
+            if (count > 0) {
+                for (size_t j=0; j<count && j<1; j++) {
+                    fprintf(stderr, "\t%8lx: ", insn[j].address);
+                    for (unsigned short i=0;i<16;i++) {
+                        if (i<insn[j].size) {
+                            fprintf(stderr, "%2.2x ", insn[j].bytes[i]);
+                        }
+                    }
+                    fprintf(stderr, "\t%s\t%s\n", insn[j].mnemonic, insn[j].op_str);
+                }
+                cs_free(insn, count);
+            }
+            cs_close(&handle);
         }
     }
     return true;
@@ -156,7 +192,7 @@ bool stepTracee(pid_t child, State &state) {
 
 bool contTracee(pid_t child, State &state) {
     if (state != State::RUNNING) {
-        printf("** state must be RUNNING\n");
+        fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     if (lastBpAddress != 0) {
@@ -173,12 +209,12 @@ bool contTracee(pid_t child, State &state) {
     }
     waitpid(child, &wait_status, 0);
     if (WIFEXITED(wait_status)) {
-        printf("** child process %d terminiated normally (code %d)\n",
+        fprintf(stderr, "** child process %d terminiated normally (code %d)\n",
             child, WEXITSTATUS(wait_status));
         state = State::LOADED;
     } else if (WIFSTOPPED(wait_status)) {
         rip = ptrace(PTRACE_PEEKUSER, child, regoffsets["rip"], 0);
-        auto it = find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
+        auto it = std::find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
             return b.address == (rip - 1);
         });
         if (it != breakpoints.end()) {
@@ -193,7 +229,42 @@ bool contTracee(pid_t child, State &state) {
                 return false;
             }
             lastBpAddress = it->address;
-            printf("** breakpoint @\n"); // todo dissasm
+            unsigned long addressVal = it->address;
+            unsigned long peek;
+            unsigned long offset;
+            char codes[16] = { 0 };
+            for (int i=0; i<2; i++) {
+                // check text ranges
+                errno = 0;
+                peek = ptrace(PTRACE_PEEKTEXT, child, addressVal+i*8, NULL);
+                if (errno != 0) { break; }
+                memcpy(&codes[i*8], &peek, sizeof(unsigned long));
+                for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
+                    if ((addressVal+i*8) <= it->address && it->address < (addressVal+i*8+8)) {
+                        offset = it->address - addressVal;
+                        codes[i*8+offset] = it->oriByte;
+                    }
+                }
+            }
+            fprintf(stderr, "** breakpoint @");
+            csh handle;
+            cs_insn *insn;
+            size_t count;
+            if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) { return false; }
+            count = cs_disasm(handle, (uint8_t*)codes, sizeof(codes), addressVal, 0, &insn);
+            if (count > 0) {
+                for (size_t j=0; j<count && j<1; j++) {
+                    fprintf(stderr, "\t%8lx: ", insn[j].address);
+                    for (unsigned short i=0;i<16;i++) {
+                        if (i<insn[j].size) {
+                            fprintf(stderr, "%2.2x ", insn[j].bytes[i]);
+                        }
+                    }
+                    fprintf(stderr, "\t%s\t%s\n", insn[j].mnemonic, insn[j].op_str);
+                }
+                cs_free(insn, count);
+            }
+            cs_close(&handle);
         }
     }
     return true;
@@ -201,42 +272,37 @@ bool contTracee(pid_t child, State &state) {
 
 bool runTracee(char *progName, pid_t child, State &state) {
     if (state == State::NOT_LOADED) {
-        printf("** state must be LOADED or RUNNING\n");
+        fprintf(stderr, "** state must be LOADED or RUNNING\n");
         return false;
     }
     if (state == State::LOADED) {
         child = startTracee(progName, state);
         contTracee(child, state);
     } else if (state == State::RUNNING) {
-        printf("** program %s is already running\n", progName);
+        fprintf(stderr, "** program %s is already running\n", progName);
         contTracee(child, state);
     }
     return true;
 }
 
-bool loadProgram(int nargs, char **args, State &state, char *progName) {
-    if (nargs < 2) {
-        printf("** no program path is given\n");
-        return false;
-    }
+bool loadProgram(State &state, char *progName) {
     if (state != State::NOT_LOADED) {
-        printf("** state must be NOT LOADED\n");
+        fprintf(stderr, "** state must be NOT LOADED\n");
         return false;
     }
     Elf64_Ehdr header;
-    FILE *file = fopen(args[1], "rb");
+    FILE *file = fopen(progName, "rb");
     if (file == NULL) {
-        printf("** '%s' no such file or directory\n", args[1]);
+        fprintf(stderr, "** '%s' no such file or directory\n", progName);
         return false;
     }
     fread(&header, sizeof(header), 1, file);
     if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0) {
-        printf("** program '%s' is not ELF file\n", args[1]);
+        fprintf(stderr, "** program '%s' is not ELF file\n", progName);
         fclose(file);
         return false;
     }
-    printf("** program '%s' loaded. entry point 0x%lx\n", args[1], header.e_entry);
-    strncpy(progName, args[1], 256);
+    fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, header.e_entry);
     state = State::LOADED;
     fclose(file);
     return true;
@@ -244,14 +310,14 @@ bool loadProgram(int nargs, char **args, State &state, char *progName) {
 
 bool getRegs(pid_t child, State &state) {
     if (state != State::RUNNING) {
-        printf("** state must be RUNNING\n");
+        fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     struct user_regs_struct regs;
     if(ptrace(PTRACE_GETREGS, child, 0, &regs) != 0) {
         return false;
     }
-    printf("RAX %-16llx RBX %-16llx  RCX %-16llx RDX %-16llx\n"
+    fprintf(stderr, "RAX %-16llx RBX %-16llx  RCX %-16llx RDX %-16llx\n"
            "R8  %-16llx R9  %-16llx  R10 %-16llx R11 %-16llx\n"
            "R12 %-16llx R13 %-16llx  R14 %-16llx R15 %-16llx\n"
            "RDI %-16llx RSI %-16llx  RBP %-16llx RSP %-16llx\n"
@@ -267,38 +333,38 @@ bool getRegs(pid_t child, State &state) {
 
 bool getSingleReg(int nargs, pid_t child, State &state, char *regName) {
     if (nargs < 2) {
-        printf("** no register is given\n");
+        fprintf(stderr, "** no register is given\n");
         return false;
     }
     if (state != State::RUNNING) {
-        printf("** state must be RUNNING\n");
+        fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     std::string regkey(regName);
     auto iter = regoffsets.find(regkey);
     if (iter == regoffsets.end()) {
-        printf("** undefined register\n");
+        fprintf(stderr, "** undefined register\n");
         return false;
     }
     unsigned long regVal;
     regVal = ptrace(PTRACE_PEEKUSER, child, iter->second, 0);
-    printf("%s = %ld (0x%lx)\n", regName, regVal, regVal);
+    fprintf(stderr, "%s = %ld (0x%lx)\n", regName, regVal, regVal);
     return true;
 }
 
 bool setSingleReg(int nargs, pid_t child, State &state, char *regName, char *regValptr) {
     if (nargs < 3) {
-        printf("** Not enough input arguments\n");
+        fprintf(stderr, "** Not enough input arguments\n");
         return false;
     }
     if (state != State::RUNNING) {
-        printf("** state must be RUNNING\n");
+        fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     std::string regkey(regName);
     auto iter = regoffsets.find(regkey);
     if (iter == regoffsets.end()) {
-        printf("** undefined register\n");
+        fprintf(stderr, "** undefined register\n");
         return false;
     }
     unsigned long regVal = strtoul(regValptr, NULL, 16);
@@ -311,11 +377,11 @@ bool setSingleReg(int nargs, pid_t child, State &state, char *regName, char *reg
 
 bool dumpMemory(int nargs, pid_t child, State &state, char *address) {
     if (nargs < 2) {
-        printf("** no addr is given\n");
+        fprintf(stderr, "** no addr is given\n");
         return false;
     }
     if (state != State::RUNNING) {
-        printf("** state must be RUNNING\n");
+        fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     unsigned long addressVal = strtoul(address, NULL, 16);
@@ -325,14 +391,14 @@ bool dumpMemory(int nargs, pid_t child, State &state, char *address) {
     memset(strbuf, 0, 17);
 
     for (int i=0;i<10;i++) {
-        if (i%2==0) { printf("      0x%lx:", addressVal + i*8); }
+        if (i%2==0) { fprintf(stderr, "      0x%lx:", addressVal + i*8); }
         ret = ptrace(PTRACE_PEEKTEXT, child, addressVal + i*8, 0);
         for (int j=0;j<8;j++) {
-            printf(" %2.2x", ptr[j]);
+            fprintf(stderr, " %2.2x", ptr[j]);
             strbuf[j + i%2*8] = (isprint(ptr[j]) == 0) ? '.' : ptr[j];
         }
         if (i%2==1) {
-            printf(" |%s|\n", strbuf);
+            fprintf(stderr, " |%s|\n", strbuf);
         }
     }
     return true;
@@ -340,7 +406,7 @@ bool dumpMemory(int nargs, pid_t child, State &state, char *address) {
 
 bool dumpVMMap(pid_t child, State &state) {
     if (state != State::RUNNING) {
-        printf("** state must be RUNNING\n");
+        fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     char buf[512];
@@ -366,28 +432,28 @@ bool dumpVMMap(pid_t child, State &state) {
         offset = strtol(args[2], NULL, 16);
         if (strlen(args[1]) < 4) { continue; }
         args[1][3] = '\0';
-        printf("%016lx-%016lx %s %-8lx %s\n", vm_begin, vm_end, args[1], offset, args[5]);
+        fprintf(stderr, "%016lx-%016lx %s %-8lx %s\n", vm_begin, vm_end, args[1], offset, args[5]);
     }
     return true;
 }
 
 bool setBrackPoint(int nargs, pid_t child, State &state, char *address) {
     if (nargs < 2) {
-        printf("** no addr is given\n");
+        fprintf(stderr, "** no addr is given\n");
         return false;
     }
     if (state != State::RUNNING) {
-        printf("** state must be RUNNING\n");
+        fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     // check text range
 
     unsigned long addressVal = strtoul(address, NULL, 16);
-    auto it = find_if(breakpoints.begin(), breakpoints.end(), [addressVal](const BPinfo &b) {
+    auto it = std::find_if(breakpoints.begin(), breakpoints.end(), [addressVal](const BPinfo &b) {
         return b.address == addressVal;
     });
     if (it != breakpoints.end()) {
-        printf("** the breakpoint is already exists. (breakpoint %ld)\n", std::distance(breakpoints.begin(), it));
+        fprintf(stderr, "** the breakpoint is already exists. (breakpoint %ld)\n", std::distance(breakpoints.begin(), it));
         return false;
     }
     unsigned long code = ptrace(PTRACE_PEEKTEXT, child, addressVal, 0);
@@ -404,23 +470,23 @@ bool setBrackPoint(int nargs, pid_t child, State &state, char *address) {
 
 bool listBrackPoints() {
     for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
-        printf("%3ld: %8lx\n", std::distance(breakpoints.begin(), it), it->address);
+        fprintf(stderr, "%3ld: %8lx\n", std::distance(breakpoints.begin(), it), it->address);
     }
     return true;
 }
 
 bool deleteBrackPoint(int nargs, pid_t child, State &state, char *bpID) {
     if (nargs < 2) {
-        printf("** no addr is given\n");
+        fprintf(stderr, "** no addr is given\n");
         return false;
     }
     if (state != State::RUNNING) {
-        printf("** state must be RUNNING\n");
+        fprintf(stderr, "** state must be RUNNING\n");
         return false;
     }
     unsigned long bpnum = strtoul(bpID, NULL, 10);
     if (bpnum >= breakpoints.size()) {
-        printf("** breakpoint %ld does not exist\n", bpnum);
+        fprintf(stderr, "** breakpoint %ld does not exist\n", bpnum);
         return false;
     }
     auto it = breakpoints.begin();
@@ -432,17 +498,68 @@ bool deleteBrackPoint(int nargs, pid_t child, State &state, char *bpID) {
         return false;
     }
     breakpoints.erase(it);
-    printf("** breakpoint %ld deleted\n", bpnum);
+    fprintf(stderr, "** breakpoint %ld deleted\n", bpnum);
     return true;
 }
 
-char* getCmd(char *cmd) {
-    printf("sdb> ");
-    return fgets(cmd, 512, stdin);
+bool disAssembly(int nargs, pid_t child, State &state, char *address) {
+    if (nargs < 2) {
+        fprintf(stderr, "** no addr is given\n");
+        return false;
+    }
+    if (state != State::RUNNING) {
+        fprintf(stderr, "** state must be RUNNING\n");
+        return false;
+    }
+    unsigned long addressVal = strtoul(address, NULL, 16);
+    unsigned long peek;
+    unsigned long offset;
+    char code[160] = { 0 };
+    for (int i=0; i<20; i++) {
+        // check text ranges
+        errno = 0;
+        peek = ptrace(PTRACE_PEEKTEXT, child, addressVal+i*8, NULL);
+        if (errno != 0) { break; }
+        memcpy(&code[i*8], &peek, sizeof(unsigned long));
+        for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
+            if ((addressVal+i*8) <= it->address && it->address < (addressVal+i*8+8)) {
+                offset = it->address - addressVal;
+                code[i*8+offset] = it->oriByte;
+            }
+        }
+    }
+    csh handle;
+    cs_insn *insn;
+    size_t count;
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) { return false; }
+    count = cs_disasm(handle, (uint8_t*)code, sizeof(code), addressVal, 0, &insn);
+    if (count > 0) {
+        for (size_t j=0; j<count && j<10; j++) {
+            fprintf(stderr, "\t%lx: ", insn[j].address);
+            for (unsigned short i=0;i<16;i++) {
+                if (i<insn[j].size) {
+                    fprintf(stderr, "%2.2x ", insn[j].bytes[i]);
+                } else {
+                    fprintf(stderr, "   ");
+                }
+            }
+            fprintf(stderr, "%s\t%s\n", insn[j].mnemonic, insn[j].op_str);
+        }
+        cs_free(insn, count);
+    }
+    cs_close(&handle);
+    return true;
+}
+
+char* getCmd(char *cmd, FILE *filein) {
+    if (filein == stdin) {
+        fprintf(stderr, "sdb> ");
+    }
+    return fgets(cmd, 512, filein);
 }
 
 void printHelpMsg() {
-    printf(
+    fprintf(stderr, 
         "- break {instruction-address}: add a break point\n"
         "- cont: continue execution\n"
         "- delete {break-point-id}: remove a break point\n"
@@ -463,13 +580,46 @@ void printHelpMsg() {
 }
 
 
-int main() {
+int main(int argc, char *argv[]) {
     State state = State::NOT_LOADED;
     char cmd[512];
     char progName[256];
+    char *scriptpath = NULL;
+    char *progPath = NULL;
     pid_t tracee = -1;
+    FILE *filein = stdin;
+
+    int opt;
+    opterr = 0;
+    while ((opt = getopt(argc, argv, "s:")) != -1 ) {
+        switch (opt) {
+            case 's':
+                scriptpath = optarg;
+                break;
+            default:
+                exit(EXIT_FAILURE);
+        }
+    }
+
+    if (argc > 1) {
+        int progPos = 1;
+        while (progPos < argc) {
+            if (strcmp(argv[progPos], "-s") == 0) { progPos += 2; }
+            else { break; }
+        }
+        progPath = argv[progPos];
+    }
+
+    if (progPath != NULL) {
+        strncpy(progName, progPath, 256);
+        loadProgram(state, progName);
+    }
+
+    if (scriptpath != NULL) {
+        filein = fopen(scriptpath, "r");
+    }
     
-    while (getCmd(cmd)!= NULL) {
+    while (getCmd(cmd, filein)!= NULL) {
         int nargs = 0;
         char *token, *saveptr, *args[3], *ptr = cmd;
         while (nargs < 3 && (token = strtok_r(ptr, " \t\n", &saveptr)) != NULL) {
@@ -479,7 +629,12 @@ int main() {
         if (nargs == 0) {
             // skip
         } else if (strcmp("load", args[0]) == 0) {
-            loadProgram(nargs, args, state, progName);
+            if (nargs < 2) {
+                fprintf(stderr, "** no program path is given\n");
+            } else {
+                strncpy(progName, args[1], 256);
+                loadProgram(state, progName);
+            }
         } else if ((strcmp("exit", args[0]) == 0) || (strcmp("q", args[0]) == 0)) {
             exitProcess();
         } else if (strcmp("start", args[0]) == 0) {
@@ -508,9 +663,15 @@ int main() {
             listBrackPoints();
         } else if (strcmp("delete", args[0]) == 0) {
             deleteBrackPoint(nargs, tracee, state, args[1]);
+        } else if ((strcmp("disasm", args[0]) == 0) || (strcmp("d", args[0]) == 0)) {
+            disAssembly(nargs, tracee, state, args[1]);
         } else {
-            printf("** undefined command\n");
+            fprintf(stderr, "** undefined command\n");
         }
+    }
+
+    if (scriptpath != NULL) {
+        fclose(filein);
     }
 
     return 0;
