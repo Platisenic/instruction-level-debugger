@@ -1,10 +1,18 @@
+CXX = g++
+CFLAGS = -g -std=c++11
 
 .PHONY: all clean
 
 all: hw4
 
-hw4: hw4.cpp
-	g++ -g -std=c++11 -o hw4 hw4.cpp -lcapstone
+hw4: hw4.o putils.o
+	$(CXX) $(CFLAGS) -o $@ $^ -lcapstone
+
+hw4.o: hw4.cpp putils.h
+	$(CXX) $(CFLAGS) -c -o $@ $<
+
+putils.o : putils.cpp putils.h
+	$(CXX) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm hw4
+	rm -f hw4 *.o
