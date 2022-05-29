@@ -77,8 +77,42 @@ public:
 std::vector<BPinfo> breakpoints;
 unsigned long lastBpAddress = 0;
 
-void exitProcess() {
-    exit(0);
+bool getReg(pid_t pid, std::string regName, unsigned long &regVal) {
+    auto iter = regoffsets.find(regName);
+    if (iter == regoffsets.end()) { return false; }
+    regVal = ptrace(PTRACE_PEEKUSER, pid, iter->second, 0);
+    return true;
+}
+
+bool setReg(pid_t pid, std::string regName, unsigned long regVal) {
+    auto iter = regoffsets.find(regName);
+    if (iter == regoffsets.end()) { return false; }
+    if (ptrace(PTRACE_POKEUSER, pid, iter->second, regVal) < 0) {
+        perror("** pokeuser");
+        return true;
+    }
+    return true;
+}
+
+bool patch_setBreakpoint(pid_t pid, unsigned long addressVal, unsigned long *oriByte) {
+    unsigned long code = ptrace(PTRACE_PEEKTEXT, pid, addressVal, 0);
+    if (oriByte != NULL) {
+        *oriByte = code & 0xff;
+    }
+    if (ptrace(PTRACE_POKETEXT, pid, addressVal, (code & 0xffffffffffffff00) | 0xcc) != 0) {
+        perror("** poketest");
+        return false;
+    }
+    return true;
+}
+
+bool patch_clearBreakpoint(pid_t pid, unsigned long addressVal, unsigned long oriByte) {
+    unsigned long code = ptrace(PTRACE_PEEKTEXT, pid, addressVal, 0);
+    if (ptrace(PTRACE_POKETEXT, pid, addressVal, (code & 0xffffffffffffff00) | oriByte) != 0) {
+        perror("** poketest");
+        return false;
+    }
+    return true;
 }
 
 void printInstr(std::vector<Instruction> &instrs) {
@@ -130,7 +164,7 @@ void disAsmInstr(std::vector<Instruction> &instrs, pid_t pid, unsigned long star
     cs_close(&handle);
 }
 
-pid_t startTracee(char *progName, State &state) {
+pid_t CMD_startTracee(char *progName, State &state) {
     if (state != State::LOADED) {
         fprintf(stderr, "** state must be LOADED\n");
         return -1;
@@ -158,12 +192,7 @@ pid_t startTracee(char *progName, State &state) {
         }
 		ptrace(PTRACE_SETOPTIONS, child, 0, PTRACE_O_EXITKILL);
         for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
-            code = ptrace(PTRACE_PEEKTEXT, child, it->address, 0);
-            code = (code & 0xffffffffffffff00) | 0xcc;
-            if (ptrace(PTRACE_POKETEXT, child, it->address, code) != 0) {
-                perror("** poketest");
-                return -1;
-            }
+            patch_setBreakpoint(child, it->address, NULL);
         }
         state = State::RUNNING;
         fprintf(stderr, "** pid %d\n", child);
@@ -171,16 +200,15 @@ pid_t startTracee(char *progName, State &state) {
     return child;
 }
 
-bool stepTracee(pid_t pid, State &state) {
+void CMD_stepTracee(pid_t pid, State &state) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
+        return;
     }
     int wait_status;
-    unsigned long rip, code;
     if(ptrace(PTRACE_SINGLESTEP, pid, 0, 0) < 0) {
         perror("** singlestep");
-        return false;
+        return;
     }
     waitpid(pid, &wait_status, 0);
     if (WIFEXITED(wait_status)) {
@@ -193,55 +221,41 @@ bool stepTracee(pid_t pid, State &state) {
             return b.address == address;
         });
         if (it != breakpoints.end()) {
-            code = ptrace(PTRACE_PEEKTEXT, pid, it->address, 0);
-            code = (code & 0xffffffffffffff00) | 0xcc;
-            if (ptrace(PTRACE_POKETEXT, pid, it->address, code) != 0) {
-                perror("** poketest");
-                return false;
-            }
+            patch_setBreakpoint(pid, it->address, NULL);
         }
         lastBpAddress = 0;
-        rip = ptrace(PTRACE_PEEKUSER, pid, regoffsets["rip"], 0);
+        unsigned long rip;
+        getReg(pid, "rip", rip);
         it = std::find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
             return b.address == (rip - 1);
         });
-        if (it == breakpoints.end()) { return true; }
+        if (it == breakpoints.end()) { return; }
         // hit breakpoint
-        code = ptrace(PTRACE_PEEKTEXT, pid, it->address, 0);
-        code = (code & 0xffffffffffffff00) | it->oriByte;
-        if (ptrace(PTRACE_POKETEXT, pid, it->address, code) != 0) {
-            perror("** poketest");
-            return false;
-        }
-        if (ptrace(PTRACE_POKEUSER, pid, regoffsets["rip"], rip - 1) < 0) {
-            perror("** pokeuser");
-            return false;
-        }
+        patch_clearBreakpoint(pid, it->address, it->oriByte);
+        setReg(pid, "rip", rip-1);
         lastBpAddress = it->address;
         std::vector<Instruction> instrs;
         disAsmInstr(instrs, pid, it->address, 1);
         fprintf(stderr, "** breakpoint @");
         printInstr(instrs);
     }
-    return true;
 }
 
-bool contTracee(pid_t pid, State &state) {
+void CMD_contTracee(pid_t pid, State &state) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
+        return;
     }
     if (lastBpAddress != 0) {
-        stepTracee(pid ,state);
+        CMD_stepTracee(pid ,state);
         if (lastBpAddress != 0) { // encounter breakpoints in stepTracee
-            return true;
+            return;
         }
     }
     int wait_status;
-    unsigned long rip, code;
     if(ptrace(PTRACE_CONT, pid, 0, 0) < 0) {
         perror("** cont");
-        return false;
+        return;
     }
     waitpid(pid, &wait_status, 0);
     if (WIFEXITED(wait_status)) {
@@ -249,78 +263,65 @@ bool contTracee(pid_t pid, State &state) {
             pid, WEXITSTATUS(wait_status));
         state = State::LOADED;
     } else if (WIFSTOPPED(wait_status)) {
-        rip = ptrace(PTRACE_PEEKUSER, pid, regoffsets["rip"], 0);
+        unsigned long rip;
+        getReg(pid, "rip", rip);
         auto it = std::find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
             return b.address == (rip - 1);
         });
-        if (it == breakpoints.end()) { return true; }
+        if (it == breakpoints.end()) { return; }
         // hit breakpoint
-        code = ptrace(PTRACE_PEEKTEXT, pid, it->address, 0);
-        code = (code & 0xffffffffffffff00) | it->oriByte;
-        if (ptrace(PTRACE_POKETEXT, pid, it->address, code) != 0) {
-            perror("** poketest");
-            return false;
-        }
-        if (ptrace(PTRACE_POKEUSER, pid, regoffsets["rip"], rip - 1) < 0) {
-            perror("** pokeuser");
-            return false;
-        }
+        patch_clearBreakpoint(pid, it->address, it->oriByte);
+        setReg(pid, "rip", rip-1);
         lastBpAddress = it->address;
         std::vector<Instruction> instrs;
         disAsmInstr(instrs, pid, it->address, 1);
         fprintf(stderr, "** breakpoint @");
-        printInstr(instrs);
-        
+        printInstr(instrs);   
     }
-    return true;
 }
 
-bool runTracee(char *progName, pid_t child, State &state) {
+void CMD_runTracee(char *progName, pid_t child, State &state) {
     if (state == State::NOT_LOADED) {
         fprintf(stderr, "** state must be LOADED or RUNNING\n");
-        return false;
-    }
-    if (state == State::LOADED) {
-        child = startTracee(progName, state);
-        contTracee(child, state);
+    } else if (state == State::LOADED) {
+        child = CMD_startTracee(progName, state);
+        CMD_contTracee(child, state);
     } else if (state == State::RUNNING) {
         fprintf(stderr, "** program %s is already running\n", progName);
-        contTracee(child, state);
+        CMD_contTracee(child, state);
     }
-    return true;
 }
 
-bool loadProgram(State &state, char *progName) {
+void CMD_loadProgram(State &state, char *progName) {
     if (state != State::NOT_LOADED) {
         fprintf(stderr, "** state must be NOT LOADED\n");
-        return false;
+        return;
     }
     Elf64_Ehdr header;
     FILE *file = fopen(progName, "rb");
     if (file == NULL) {
         fprintf(stderr, "** '%s' no such file or directory\n", progName);
-        return false;
+        return;
     }
     fread(&header, sizeof(header), 1, file);
     if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0) {
         fprintf(stderr, "** program '%s' is not ELF file\n", progName);
         fclose(file);
-        return false;
+        return;
     }
     fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, header.e_entry);
     state = State::LOADED;
     fclose(file);
-    return true;
 }
 
-bool getRegs(pid_t child, State &state) {
+void CMD_getRegs(pid_t pid, State &state) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
+        return;
     }
     struct user_regs_struct regs;
-    if(ptrace(PTRACE_GETREGS, child, 0, &regs) != 0) {
-        return false;
+    if (ptrace(PTRACE_GETREGS, pid, 0, &regs) != 0) {
+        return;
     }
     fprintf(stderr, "RAX %-16llx RBX %-16llx  RCX %-16llx RDX %-16llx\n"
            "R8  %-16llx R9  %-16llx  R10 %-16llx R11 %-16llx\n"
@@ -332,62 +333,38 @@ bool getRegs(pid_t child, State &state) {
             regs.r12, regs.r13, regs.r14, regs.r15,
             regs.rdi, regs.rsi, regs.rbp, regs.rsp,
             regs.rip, regs.eflags);
-
-    return true;
 }
 
-bool getSingleReg(int nargs, pid_t child, State &state, char *regName) {
-    if (nargs < 2) {
-        fprintf(stderr, "** no register is given\n");
-        return false;
-    }
+void CMD_get(pid_t pid, State &state, char *regName) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
-    }
-    std::string regkey(regName);
-    auto iter = regoffsets.find(regkey);
-    if (iter == regoffsets.end()) {
-        fprintf(stderr, "** undefined register\n");
-        return false;
+        return;
     }
     unsigned long regVal;
-    regVal = ptrace(PTRACE_PEEKUSER, child, iter->second, 0);
-    fprintf(stderr, "%s = %ld (0x%lx)\n", regName, regVal, regVal);
-    return true;
+    std::string regNamestr(regName);
+    if (getReg(pid, regNamestr, regVal)) {
+        fprintf(stderr, "%s = %ld (0x%lx)\n", regName, regVal, regVal);
+    } else {
+        fprintf(stderr, "** undefined register\n");
+    }
 }
 
-bool setSingleReg(int nargs, pid_t child, State &state, char *regName, char *regValptr) {
-    if (nargs < 3) {
-        fprintf(stderr, "** Not enough input arguments\n");
-        return false;
-    }
+void CMD_set(pid_t pid, State &state, char *regName, char *regValptr) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
-    }
-    std::string regkey(regName);
-    auto iter = regoffsets.find(regkey);
-    if (iter == regoffsets.end()) {
-        fprintf(stderr, "** undefined register\n");
-        return false;
+        return;
     }
     unsigned long regVal = strtoul(regValptr, NULL, 16);
-    if (ptrace(PTRACE_POKEUSER, child, iter->second, regVal) < 0) {
-        perror("** pokeuser");
-        return false;
+    std::string regNamestr(regName);
+    if (!setReg(pid, regNamestr, regVal)) {
+        fprintf(stderr, "** undefined register\n");
     }
-    return true;
 }
 
-bool dumpMemory(int nargs, pid_t child, State &state, char *address) {
-    if (nargs < 2) {
-        fprintf(stderr, "** no addr is given\n");
-        return false;
-    }
+void CMD_dump(pid_t child, State &state, char *address) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
+        return;
     }
     unsigned long addressVal = strtoul(address, NULL, 16);
     long ret;
@@ -396,7 +373,7 @@ bool dumpMemory(int nargs, pid_t child, State &state, char *address) {
     memset(strbuf, 0, 17);
 
     for (int i=0;i<10;i++) {
-        if (i%2==0) { fprintf(stderr, "      0x%lx:", addressVal + i*8); }
+        if (i%2==0) { fprintf(stderr, "0x%12lx:", addressVal + i*8); }
         ret = ptrace(PTRACE_PEEKTEXT, child, addressVal + i*8, 0);
         for (int j=0;j<8;j++) {
             fprintf(stderr, " %2.2x", ptr[j]);
@@ -406,13 +383,12 @@ bool dumpMemory(int nargs, pid_t child, State &state, char *address) {
             fprintf(stderr, " |%s|\n", strbuf);
         }
     }
-    return true;
 }
 
-bool dumpVMMap(pid_t child, State &state) {
+void CMD_vmmap(pid_t child, State &state) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
+        return;
     }
     char buf[512];
     char mmap_path[128];
@@ -420,7 +396,7 @@ bool dumpVMMap(pid_t child, State &state) {
     long vm_begin, vm_end, offset;
 
     snprintf(mmap_path, sizeof(mmap_path), "/proc/%u/maps", child);
-    if ((fp = fopen(mmap_path, "rt")) == NULL) { perror("** fopen"); return false; }
+    if ((fp = fopen(mmap_path, "rt")) == NULL) { perror("** fopen"); return; }
     while (fgets(buf, sizeof(buf), fp) != NULL) {
         int nargs = 0;
         char *token, *saveptr, *args[8], *ptr = buf;
@@ -439,17 +415,12 @@ bool dumpVMMap(pid_t child, State &state) {
         args[1][3] = '\0';
         fprintf(stderr, "%016lx-%016lx %s %-8lx %s\n", vm_begin, vm_end, args[1], offset, args[5]);
     }
-    return true;
 }
 
-bool setBrackPoint(int nargs, pid_t child, State &state, char *address) {
-    if (nargs < 2) {
-        fprintf(stderr, "** no addr is given\n");
-        return false;
-    }
+void CMD_createBreakPoint(pid_t pid, State &state, char *address) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
+        return;
     }
     // check text range
 
@@ -459,52 +430,36 @@ bool setBrackPoint(int nargs, pid_t child, State &state, char *address) {
     });
     if (it != breakpoints.end()) {
         fprintf(stderr, "** the breakpoint is already exists. (breakpoint %ld)\n", std::distance(breakpoints.begin(), it));
-        return false;
+        return;
     }
-    unsigned long code = ptrace(PTRACE_PEEKTEXT, child, addressVal, 0);
-    unsigned long oriByte = code & 0xff;
-    unsigned long patchedCode = (code & 0xffffffffffffff00) | 0xcc;
-    if (ptrace(PTRACE_POKETEXT, child, addressVal, patchedCode) != 0) {
-        perror("** poketest");
-        return false;
+    unsigned long oriByte;
+    if (patch_setBreakpoint(pid, addressVal, &oriByte)) {
+        breakpoints.push_back(BPinfo(addressVal, oriByte));
     }
-    breakpoints.push_back(BPinfo(addressVal, oriByte));
-    
-    return true;
 }
 
-bool listBrackPoints() {
+void CMD_listBreakPoints() {
     for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
         fprintf(stderr, "%3ld: %8lx\n", std::distance(breakpoints.begin(), it), it->address);
     }
-    return true;
 }
 
-bool deleteBrackPoint(int nargs, pid_t child, State &state, char *bpID) {
-    if (nargs < 2) {
-        fprintf(stderr, "** no addr is given\n");
-        return false;
-    }
+void CMD_deleteBreakPoint(pid_t pid, State &state, char *bpID) {
     if (state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
-        return false;
+        return;
     }
     unsigned long bpnum = strtoul(bpID, NULL, 10);
     if (bpnum >= breakpoints.size()) {
         fprintf(stderr, "** breakpoint %ld does not exist\n", bpnum);
-        return false;
+        return;
     }
     auto it = breakpoints.begin();
     std::advance(it, bpnum);
-    unsigned long code = ptrace(PTRACE_PEEKTEXT, child, it->address, 0);
-    code = (code & 0xffffffffffffff00) | it->oriByte;
-    if (ptrace(PTRACE_POKETEXT, child, it->address, code) != 0) {
-        perror("** poketest");
-        return false;
+    if (patch_clearBreakpoint(pid, it->address, it->oriByte)) {
+        breakpoints.erase(it);
+        fprintf(stderr, "** breakpoint %ld deleted\n", bpnum);
     }
-    breakpoints.erase(it);
-    fprintf(stderr, "** breakpoint %ld deleted\n", bpnum);
-    return true;
 }
 
 void CMD_disAssembly(pid_t pid, State &state, char *address) {
@@ -525,7 +480,7 @@ char* getCmd(char *cmd, FILE *filein) {
     return fgets(cmd, 512, filein);
 }
 
-void printHelpMsg() {
+void CMD_printHelpMsg() {
     fprintf(stderr, 
         "- break {instruction-address}: add a break point\n"
         "- cont: continue execution\n"
@@ -579,7 +534,7 @@ int main(int argc, char *argv[]) {
 
     if (progPath != NULL) {
         strncpy(progName, progPath, 256);
-        loadProgram(state, progName);
+        CMD_loadProgram(state, progName);
     }
 
     if (scriptpath != NULL) {
@@ -593,57 +548,75 @@ int main(int argc, char *argv[]) {
             args[nargs++] = token;
             ptr = NULL;
         }
-        if (nargs == 0) {
-            // skip
+        if (nargs == 0) { continue; }
+
+        if ((strcmp("exit", args[0]) == 0) || (strcmp("q", args[0]) == 0)) {
+            exit(0);
+        } else if (strcmp("start", args[0]) == 0) {
+            tracee = CMD_startTracee(progName, state);
+        } else if ((strcmp("cont", args[0]) == 0) || (strcmp("c", args[0]) == 0)) {
+            CMD_contTracee(tracee, state);
+        } else if ((strcmp("run", args[0]) == 0) || (strcmp("r", args[0]) == 0)) {
+            CMD_runTracee(progName, tracee , state);
+        } else if (strcmp("si", args[0]) == 0) {
+            CMD_stepTracee(tracee, state);
+        } else if (strcmp("getregs", args[0]) == 0) {
+            CMD_getRegs(tracee, state);
+        } else if ((strcmp("help", args[0]) == 0) || (strcmp("h", args[0]) == 0)) {
+            CMD_printHelpMsg();
+        } else if ((strcmp("vmmap", args[0]) == 0) || (strcmp("m", args[0]) == 0)) {
+            CMD_vmmap(tracee, state);
+        } else if ((strcmp("list", args[0]) == 0) || (strcmp("l", args[0]) == 0)) {
+            CMD_listBreakPoints();
         } else if (strcmp("load", args[0]) == 0) {
             if (nargs < 2) {
                 fprintf(stderr, "** no program path is given\n");
             } else {
                 strncpy(progName, args[1], 256);
-                loadProgram(state, progName);
+                CMD_loadProgram(state, progName);
             }
-        } else if ((strcmp("exit", args[0]) == 0) || (strcmp("q", args[0]) == 0)) {
-            exitProcess();
-        } else if (strcmp("start", args[0]) == 0) {
-            tracee = startTracee(progName, state);
-        } else if ((strcmp("cont", args[0]) == 0) || (strcmp("c", args[0]) == 0)) {
-            contTracee(tracee, state);
-        } else if ((strcmp("run", args[0]) == 0) || (strcmp("r", args[0]) == 0)) {
-            runTracee(progName, tracee , state);
-        } else if (strcmp("si", args[0]) == 0) {
-            stepTracee(tracee, state);
-        } else if (strcmp("getregs", args[0]) == 0) {
-            getRegs(tracee, state);
         } else if ((strcmp("get", args[0]) == 0) || (strcmp("g", args[0]) == 0)) {
-            getSingleReg(nargs, tracee, state, args[1]);
-        } else if ((strcmp("set", args[0]) == 0) || (strcmp("s", args[0]) == 0)) {
-            setSingleReg(nargs, tracee, state, args[1], args[2]);
-        } else if ((strcmp("help", args[0]) == 0) || (strcmp("h", args[0]) == 0)) {
-            printHelpMsg();
+            if (nargs < 2) {
+                fprintf(stderr, "** no register is given\n");
+            } else {
+                CMD_get(tracee, state, args[1]);
+            }
         } else if ((strcmp("dump", args[0]) == 0) || (strcmp("x", args[0]) == 0)) {
-            dumpMemory(nargs, tracee, state, args[1]);
-        } else if ((strcmp("vmmap", args[0]) == 0) || (strcmp("m", args[0]) == 0)) {
-            dumpVMMap(tracee, state);
+            if (nargs < 2) {
+                fprintf(stderr, "** no addr is given\n");
+            } else {
+                CMD_dump(tracee, state, args[1]);
+            }
         } else if ((strcmp("break", args[0]) == 0) || (strcmp("b", args[0]) == 0)) {
-            setBrackPoint(nargs, tracee, state, args[1]);
-        } else if ((strcmp("list", args[0]) == 0) || (strcmp("l", args[0]) == 0)) {
-            listBrackPoints();
+            if (nargs < 2) {
+                fprintf(stderr, "** no addr is given\n");
+            } else {
+                CMD_createBreakPoint(tracee, state, args[1]);
+            }
         } else if (strcmp("delete", args[0]) == 0) {
-            deleteBrackPoint(nargs, tracee, state, args[1]);
+            if (nargs < 2) {
+                fprintf(stderr, "** no addr is given\n");
+            } else {
+                CMD_deleteBreakPoint(tracee, state, args[1]);
+            }
         } else if ((strcmp("disasm", args[0]) == 0) || (strcmp("d", args[0]) == 0)) {
             if (nargs < 2) {
                 fprintf(stderr, "** no addr is given\n");
             } else {
                 CMD_disAssembly(tracee, state, args[1]);
             }
+        } else if ((strcmp("set", args[0]) == 0) || (strcmp("s", args[0]) == 0)) {
+            if (nargs < 3) {
+                fprintf(stderr, "** Not enough input arguments\n");
+            } else {
+                CMD_set(tracee, state, args[1], args[2]);
+            }
         } else {
             fprintf(stderr, "** undefined command\n");
         }
     }
-
     if (scriptpath != NULL) {
         fclose(filein);
     }
-
     return 0;
 }
