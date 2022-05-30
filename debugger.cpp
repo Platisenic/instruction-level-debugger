@@ -134,7 +134,7 @@ void Debugger::CMD_loadProgram(char *progName) {
         return;
     }
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "readelf -S %s", progName);
+    snprintf(cmd, sizeof(cmd), "readelf -S %s 2>&1", progName);
     FILE* fp = popen(cmd, "r");
     char output[512];
     unsigned long textStart = 0;
@@ -162,12 +162,14 @@ void Debugger::CMD_loadProgram(char *progName) {
             }
         }
     }
-    if (textStart != 0 && textSize != 0) {
-        m_textsection.start = textStart;
-        m_textsection.end = textStart + textSize - 1;
-        m_state = State::LOADED;
-        fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, textStart);
-    }
+    if (!(textStart != 0 && textSize != 0)) {
+        fprintf(stderr, "** No such file or directory\n");
+        exit(1);
+    } 
+    m_textsection.start = textStart;
+    m_textsection.end = textStart + textSize - 1;
+    m_state = State::LOADED;
+    fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, textStart);
     pclose(fp);
 }
 

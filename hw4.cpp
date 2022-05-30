@@ -4,17 +4,17 @@
 int main(int argc, char *argv[]) {
     char cmd[512];
     char progName[256];
-    char *scriptpath = NULL;
     char *progPath = NULL;
     FILE *filein = stdin;
     int opt;
-    opterr = 0;
+
     while ((opt = getopt(argc, argv, "s:")) != -1 ) {
         switch (opt) {
             case 's':
-                scriptpath = optarg;
+                filein = fopen(optarg, "r");
                 break;
             default:
+                fprintf(stderr, "usage: ./hw4 [-s script] [program]\n");
                 exit(EXIT_FAILURE);
         }
     }
@@ -35,10 +35,6 @@ int main(int argc, char *argv[]) {
         dbg.CMD_loadProgram(progName);
     }
 
-    if (scriptpath != NULL) {
-        filein = fopen(scriptpath, "r");
-    }
-    
     while (getCmd(cmd, filein)!= NULL) {
         int nargs = 0;
         char *token, *saveptr, *args[3], *ptr = cmd;
@@ -113,8 +109,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "** undefined command\n");
         }
     }
-    if (scriptpath != NULL) {
-        fclose(filein);
-    }
+    
+    fclose(filein);
     return 0;
 }
