@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
+#include <string.h>
 
 #include <string>
 #include <map>
@@ -60,6 +61,7 @@ public:
     }
 };
 
+char* getCmd(char *cmd, FILE *filein);
 bool getReg(pid_t pid, std::string regName, unsigned long &regVal);
 bool setReg(pid_t pid, std::string regName, unsigned long regVal);
 bool patch_setBreakpoint(pid_t pid, unsigned long addressVal, unsigned long *oriByte);

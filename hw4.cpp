@@ -1,400 +1,12 @@
-#include <stdio.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/ptrace.h>
-#include <sys/user.h>
-#include <string.h>
-#include <elf.h>
-#include <ctype.h>
-#include <capstone/capstone.h>
-
-#include <map>
-#include <string>
-#include <vector>
-#include <algorithm>
-
 #include "putils.h"
-
-std::vector<BPinfo> breakpoints;
-AddressRange textsection;
-unsigned long lastBpAddress = 0;
-
-pid_t CMD_startTracee(char *progName, State &state) {
-    if (state != State::LOADED) {
-        fprintf(stderr, "** state must be LOADED\n");
-        return -1;
-    }
-    char *argv[] = {progName, NULL};
-    pid_t child;
-    int wait_State;
-    unsigned long code;
-    if ((child = fork()) < 0) {
-        perror("** fork");
-        return -1;
-    }
-    if (child == 0) {
-		if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) {
-            perror("** ptrace@child");
-            exit(1);
-        }
-		execv(argv[0], argv);
-        perror("** execv");
-		exit(1);
-	} else {
-        if (waitpid(child, &wait_State, 0) < 0) {
-            perror("** waitpid");
-            return -1;
-        }
-		ptrace(PTRACE_SETOPTIONS, child, 0, PTRACE_O_EXITKILL);
-        for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
-            patch_setBreakpoint(child, it->address, NULL);
-        }
-        state = State::RUNNING;
-        fprintf(stderr, "** pid %d\n", child);
-    }
-    return child;
-}
-
-void CMD_stepTracee(pid_t pid, State &state) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    int wait_status;
-    if(ptrace(PTRACE_SINGLESTEP, pid, 0, 0) < 0) {
-        perror("** singlestep");
-        return;
-    }
-    waitpid(pid, &wait_status, 0);
-    if (WIFEXITED(wait_status)) {
-        fprintf(stderr, "** child process %d terminiated normally (code %d)\n",
-            pid, WEXITSTATUS(wait_status));
-        state = State::LOADED;
-    } else if (WIFSTOPPED(wait_status)) {
-        unsigned long address = lastBpAddress;
-        auto it = std::find_if(breakpoints.begin(), breakpoints.end(), [address](const BPinfo &b) {
-            return b.address == address;
-        });
-        if (it != breakpoints.end()) {
-            patch_setBreakpoint(pid, it->address, NULL);
-        }
-        lastBpAddress = 0;
-        unsigned long rip;
-        getReg(pid, "rip", rip);
-        it = std::find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
-            return b.address == (rip - 1);
-        });
-        if (it == breakpoints.end()) { return; }
-        // hit breakpoint
-        patch_clearBreakpoint(pid, it->address, it->oriByte);
-        setReg(pid, "rip", rip-1);
-        lastBpAddress = it->address;
-        std::vector<Instruction> instrs;
-        disAsmInstr(instrs, breakpoints, textsection, pid, it->address, 1);
-        fprintf(stderr, "** breakpoint @");
-        printInstr(instrs);
-    }
-}
-
-void CMD_contTracee(pid_t pid, State &state) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    if (lastBpAddress != 0) {
-        CMD_stepTracee(pid ,state);
-        if (lastBpAddress != 0) { // encounter breakpoints in stepTracee
-            return;
-        }
-    }
-    int wait_status;
-    if(ptrace(PTRACE_CONT, pid, 0, 0) < 0) {
-        perror("** cont");
-        return;
-    }
-    waitpid(pid, &wait_status, 0);
-    if (WIFEXITED(wait_status)) {
-        fprintf(stderr, "** child process %d terminiated normally (code %d)\n",
-            pid, WEXITSTATUS(wait_status));
-        state = State::LOADED;
-    } else if (WIFSTOPPED(wait_status)) {
-        unsigned long rip;
-        getReg(pid, "rip", rip);
-        auto it = std::find_if(breakpoints.begin(), breakpoints.end(), [rip](const BPinfo &b) {
-            return b.address == (rip - 1);
-        });
-        if (it == breakpoints.end()) { return; }
-        // hit breakpoint
-        patch_clearBreakpoint(pid, it->address, it->oriByte);
-        setReg(pid, "rip", rip-1);
-        lastBpAddress = it->address;
-        std::vector<Instruction> instrs;
-        disAsmInstr(instrs, breakpoints, textsection, pid, it->address, 1);
-        fprintf(stderr, "** breakpoint @");
-        printInstr(instrs);   
-    }
-}
-
-void CMD_runTracee(char *progName, pid_t child, State &state) {
-    if (state == State::NOT_LOADED) {
-        fprintf(stderr, "** state must be LOADED or RUNNING\n");
-    } else if (state == State::LOADED) {
-        child = CMD_startTracee(progName, state);
-        CMD_contTracee(child, state);
-    } else if (state == State::RUNNING) {
-        fprintf(stderr, "** program %s is already running\n", progName);
-        CMD_contTracee(child, state);
-    }
-}
-
-void CMD_loadProgram(State &state, char *progName) {
-    if (state != State::NOT_LOADED) {
-        fprintf(stderr, "** state must be NOT LOADED\n");
-        return;
-    }
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "readelf -S %s", progName);
-    FILE* fp = popen(cmd, "r");
-    char output[512];
-    unsigned long textStart = 0;
-    unsigned long textSize = 0;
-    char text[] = ".text";
-    bool findtext = false;
-    while (fgets(output, sizeof(output), fp) != NULL) {
-        int nargs = 0;
-        char *token, *saveptr, *args[10], *ptr = output;
-        while (nargs < 10 && (token = strtok_r(ptr, " \t\n[]", &saveptr)) != NULL) {
-            args[nargs++] = token;
-            ptr = NULL;
-        }
-        if (findtext) {
-            if (0 < nargs) {
-                textSize = strtoul(args[0], NULL, 16);
-            }
-            break;
-        }
-        for (int i=0;i<nargs;i++) {
-            if (strcmp(args[i], text) == 0 && i+2 < nargs) {
-                findtext = true;
-                textStart = strtoul(args[i+2], NULL, 16);
-                break;
-            }
-        }
-    }
-    if (textStart != 0 && textSize != 0) {
-        textsection.start = textStart;
-        textsection.end = textStart + textSize - 1;
-        state = State::LOADED;
-        fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, textStart);
-    }
-    pclose(fp);
-}
-
-void CMD_getRegs(pid_t pid, State &state) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    struct user_regs_struct regs;
-    if (ptrace(PTRACE_GETREGS, pid, 0, &regs) != 0) {
-        return;
-    }
-    fprintf(stderr, "RAX %-16llx RBX %-16llx  RCX %-16llx RDX %-16llx\n"
-           "R8  %-16llx R9  %-16llx  R10 %-16llx R11 %-16llx\n"
-           "R12 %-16llx R13 %-16llx  R14 %-16llx R15 %-16llx\n"
-           "RDI %-16llx RSI %-16llx  RBP %-16llx RSP %-16llx\n"
-           "RIP %-16llx FLAGS %016llx\n",
-            regs.rax, regs.rbx, regs.rcx, regs.rdx,
-            regs.r8, regs.r9, regs.r10, regs.r11,
-            regs.r12, regs.r13, regs.r14, regs.r15,
-            regs.rdi, regs.rsi, regs.rbp, regs.rsp,
-            regs.rip, regs.eflags);
-}
-
-void CMD_get(pid_t pid, State &state, char *regName) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    unsigned long regVal;
-    std::string regNamestr(regName);
-    if (getReg(pid, regNamestr, regVal)) {
-        fprintf(stderr, "%s = %ld (0x%lx)\n", regName, regVal, regVal);
-    } else {
-        fprintf(stderr, "** undefined register\n");
-    }
-}
-
-void CMD_set(pid_t pid, State &state, char *regName, char *regValptr) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    unsigned long regVal = strtoul(regValptr, NULL, 16);
-    std::string regNamestr(regName);
-    if (!setReg(pid, regNamestr, regVal)) {
-        fprintf(stderr, "** undefined register\n");
-    }
-}
-
-void CMD_dump(pid_t child, State &state, char *address) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    unsigned long addressVal = strtoul(address, NULL, 16);
-    long ret;
-    unsigned char *ptr = (unsigned char *) &ret;
-    unsigned char strbuf[17];
-    memset(strbuf, 0, 17);
-
-    for (int i=0;i<10;i++) {
-        if (i%2==0) { fprintf(stderr, "0x%12lx:", addressVal + i*8); }
-        ret = ptrace(PTRACE_PEEKTEXT, child, addressVal + i*8, 0);
-        for (int j=0;j<8;j++) {
-            fprintf(stderr, " %2.2x", ptr[j]);
-            strbuf[j + i%2*8] = (isprint(ptr[j]) == 0) ? '.' : ptr[j];
-        }
-        if (i%2==1) {
-            fprintf(stderr, " |%s|\n", strbuf);
-        }
-    }
-}
-
-void CMD_vmmap(pid_t child, State &state) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    char buf[512];
-    char mmap_path[128];
-    FILE *fp;
-    long vm_begin, vm_end, offset;
-
-    snprintf(mmap_path, sizeof(mmap_path), "/proc/%u/maps", child);
-    if ((fp = fopen(mmap_path, "rt")) == NULL) { perror("** fopen"); return; }
-    while (fgets(buf, sizeof(buf), fp) != NULL) {
-        int nargs = 0;
-        char *token, *saveptr, *args[8], *ptr = buf;
-        while (nargs < 8 && (token = strtok_r(ptr, " \t\n\r", &saveptr)) != NULL) {
-			args[nargs++] = token;
-			ptr = NULL;
-		}
-        if (nargs < 6) continue;
-        if ((ptr = strchr(args[0], '-')) == NULL) { continue; }
-        *ptr = '\0';
-        vm_begin = strtol(args[0], NULL, 16);
-        vm_end = strtol(ptr+1, NULL, 16);
-    
-        offset = strtol(args[2], NULL, 16);
-        if (strlen(args[1]) < 4) { continue; }
-        args[1][3] = '\0';
-        fprintf(stderr, "%016lx-%016lx %s %-8lx %s\n", vm_begin, vm_end, args[1], offset, args[5]);
-    }
-}
-
-void CMD_createBreakPoint(pid_t pid, State &state, char *address) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    unsigned long addressVal = strtoul(address, NULL, 16);
-    if (!textsection.checkRange(addressVal)) {
-        fprintf(stderr, "** the address is out of the range of the text segment\n");
-        return;
-    }
-    auto it = std::find_if(breakpoints.begin(), breakpoints.end(), [addressVal](const BPinfo &b) {
-        return b.address == addressVal;
-    });
-    if (it != breakpoints.end()) {
-        fprintf(stderr, "** the breakpoint is already exists. (breakpoint %ld)\n", std::distance(breakpoints.begin(), it));
-        return;
-    }
-    unsigned long oriByte;
-    if (patch_setBreakpoint(pid, addressVal, &oriByte)) {
-        breakpoints.push_back(BPinfo(addressVal, oriByte));
-    }
-}
-
-void CMD_listBreakPoints() {
-    for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
-        fprintf(stderr, "%3ld: %8lx\n", std::distance(breakpoints.begin(), it), it->address);
-    }
-}
-
-void CMD_deleteBreakPoint(pid_t pid, State &state, char *bpID) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    unsigned long bpnum = strtoul(bpID, NULL, 10);
-    if (bpnum >= breakpoints.size()) {
-        fprintf(stderr, "** breakpoint %ld does not exist\n", bpnum);
-        return;
-    }
-    auto it = breakpoints.begin();
-    std::advance(it, bpnum);
-    if (patch_clearBreakpoint(pid, it->address, it->oriByte)) {
-        breakpoints.erase(it);
-        fprintf(stderr, "** breakpoint %ld deleted\n", bpnum);
-    }
-}
-
-void CMD_disAssembly(pid_t pid, State &state, char *address) {
-    if (state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
-    unsigned long addressVal = strtoul(address, NULL, 16);
-    std::vector<Instruction> instrs;
-    disAsmInstr(instrs, breakpoints, textsection, pid, addressVal, 10);
-    printInstr(instrs);
-    if (instrs.size() < 10) {
-        fprintf(stderr, "** the address is out of the range of the text segment\n");
-    }
-}
-
-char* getCmd(char *cmd, FILE *filein) {
-    if (filein == stdin) {
-        fprintf(stderr, "sdb> ");
-    }
-    return fgets(cmd, 512, filein);
-}
-
-void CMD_printHelpMsg() {
-    fprintf(stderr, 
-        "- break {instruction-address}: add a break point\n"
-        "- cont: continue execution\n"
-        "- delete {break-point-id}: remove a break point\n"
-        "- disasm addr: disassemble instructions in a file or a memory region\n"
-        "- dump addr: dump memory content\n"
-        "- exit: terminate the debugger\n"
-        "- get reg: get a single value from a register\n"
-        "- getregs: show registers\n"
-        "- help: show this message\n"
-        "- list: list break points\n"
-        "- load {path/to/a/program}: load a program\n"
-        "- run: run the program\n"
-        "- vmmap: show memory layout\n"
-        "- set reg val: get a single value to a register\n"
-        "- si: step into instruction\n"
-        "- start: start the program and stop at the first instruction\n"
-    );
-}
-
+#include "debugger.h"
 
 int main(int argc, char *argv[]) {
-    State state = State::NOT_LOADED;
     char cmd[512];
     char progName[256];
     char *scriptpath = NULL;
     char *progPath = NULL;
-    pid_t tracee = -1;
     FILE *filein = stdin;
-
     int opt;
     opterr = 0;
     while ((opt = getopt(argc, argv, "s:")) != -1 ) {
@@ -416,9 +28,11 @@ int main(int argc, char *argv[]) {
         progPath = argv[progPos];
     }
 
+    Debugger dbg;
+
     if (progPath != NULL) {
         strncpy(progName, progPath, 256);
-        CMD_loadProgram(state, progName);
+        dbg.CMD_loadProgram(progName);
     }
 
     if (scriptpath != NULL) {
@@ -437,63 +51,63 @@ int main(int argc, char *argv[]) {
         if ((strcmp("exit", args[0]) == 0) || (strcmp("q", args[0]) == 0)) {
             exit(0);
         } else if (strcmp("start", args[0]) == 0) {
-            tracee = CMD_startTracee(progName, state);
+            dbg.CMD_startTracee(progName);
         } else if ((strcmp("cont", args[0]) == 0) || (strcmp("c", args[0]) == 0)) {
-            CMD_contTracee(tracee, state);
+            dbg.CMD_contTracee();
         } else if ((strcmp("run", args[0]) == 0) || (strcmp("r", args[0]) == 0)) {
-            CMD_runTracee(progName, tracee , state);
+            dbg.CMD_runTracee(progName);
         } else if (strcmp("si", args[0]) == 0) {
-            CMD_stepTracee(tracee, state);
+            dbg.CMD_stepTracee();
         } else if (strcmp("getregs", args[0]) == 0) {
-            CMD_getRegs(tracee, state);
+            dbg.CMD_getRegs();
         } else if ((strcmp("help", args[0]) == 0) || (strcmp("h", args[0]) == 0)) {
-            CMD_printHelpMsg();
+            dbg.CMD_printHelpMsg();
         } else if ((strcmp("vmmap", args[0]) == 0) || (strcmp("m", args[0]) == 0)) {
-            CMD_vmmap(tracee, state);
+            dbg.CMD_vmmap();
         } else if ((strcmp("list", args[0]) == 0) || (strcmp("l", args[0]) == 0)) {
-            CMD_listBreakPoints();
+            dbg.CMD_listBreakPoints();
         } else if (strcmp("load", args[0]) == 0) {
             if (nargs < 2) {
                 fprintf(stderr, "** no program path is given\n");
             } else {
                 strncpy(progName, args[1], 256);
-                CMD_loadProgram(state, progName);
+                dbg.CMD_loadProgram(progName);
             }
         } else if ((strcmp("get", args[0]) == 0) || (strcmp("g", args[0]) == 0)) {
             if (nargs < 2) {
                 fprintf(stderr, "** no register is given\n");
             } else {
-                CMD_get(tracee, state, args[1]);
+                dbg.CMD_get(args[1]);
             }
         } else if ((strcmp("dump", args[0]) == 0) || (strcmp("x", args[0]) == 0)) {
             if (nargs < 2) {
                 fprintf(stderr, "** no addr is given\n");
             } else {
-                CMD_dump(tracee, state, args[1]);
+                dbg.CMD_dump(args[1]);
             }
         } else if ((strcmp("break", args[0]) == 0) || (strcmp("b", args[0]) == 0)) {
             if (nargs < 2) {
                 fprintf(stderr, "** no addr is given\n");
             } else {
-                CMD_createBreakPoint(tracee, state, args[1]);
+                dbg.CMD_createBreakPoint(args[1]);
             }
         } else if (strcmp("delete", args[0]) == 0) {
             if (nargs < 2) {
                 fprintf(stderr, "** no addr is given\n");
             } else {
-                CMD_deleteBreakPoint(tracee, state, args[1]);
+                dbg.CMD_deleteBreakPoint(args[1]);
             }
         } else if ((strcmp("disasm", args[0]) == 0) || (strcmp("d", args[0]) == 0)) {
             if (nargs < 2) {
                 fprintf(stderr, "** no addr is given\n");
             } else {
-                CMD_disAssembly(tracee, state, args[1]);
+                dbg.CMD_disAssembly(args[1]);
             }
         } else if ((strcmp("set", args[0]) == 0) || (strcmp("s", args[0]) == 0)) {
             if (nargs < 3) {
                 fprintf(stderr, "** Not enough input arguments\n");
             } else {
-                CMD_set(tracee, state, args[1], args[2]);
+                dbg.CMD_set(args[1], args[2]);
             }
         } else {
             fprintf(stderr, "** undefined command\n");

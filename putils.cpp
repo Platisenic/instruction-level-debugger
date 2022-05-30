@@ -119,3 +119,9 @@ void disAsmInstr(
     }
     cs_close(&handle);
 }
+char* getCmd(char *cmd, FILE *filein) {
+    if (filein == stdin) {
+        fprintf(stderr, "sdb> ");
+    }
+    return fgets(cmd, 512, filein);
+}
