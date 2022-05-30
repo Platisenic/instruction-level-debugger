@@ -56,6 +56,8 @@ public:
 
 std::vector<BPinfo> breakpoints;
 unsigned long lastBpAddress = 0;
+unsigned long StartAddress = 0;
+unsigned long EndAddress = 0;
 
 void printInstr(std::vector<Instruction> &instrs) {
     char bytes[128] = "";
@@ -73,15 +75,17 @@ void disAsmInstr(std::vector<Instruction> &instrs, pid_t pid, unsigned long star
     // peek
     for (int i=0; i<num*2; i++) {
         // todo check text ranges
-        errno = 0;
-        peek = ptrace(PTRACE_PEEKTEXT, pid, startAddr+i*8, NULL);
-        if (errno != 0) { break; }
-        memcpy(&codes[i*8], &peek, sizeof(peek));
-        // clear brackpoints
-        for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
-            if ((startAddr+i*8) <= it->address && it->address < (startAddr+i*8+8)) {
-                offset = it->address - (startAddr+i*8);
-                codes[i*8+offset] = it->oriByte;
+        if (StartAddress <= (startAddr+i*8) && (startAddr+i*8) <= EndAddress) {
+            errno = 0;
+            peek = ptrace(PTRACE_PEEKTEXT, pid, startAddr+i*8, NULL);
+            if (errno != 0) { break; }
+            memcpy(&codes[i*8], &peek, sizeof(peek));
+            // clear brackpoints
+            for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
+                if ((startAddr+i*8) <= it->address && it->address < (startAddr+i*8+8)) {
+                    offset = it->address - (startAddr+i*8);
+                    codes[i*8+offset] = it->oriByte;
+                }
             }
         }
     }
@@ -93,13 +97,15 @@ void disAsmInstr(std::vector<Instruction> &instrs, pid_t pid, unsigned long star
     count = cs_disasm(handle, (uint8_t*)codes, sizeof(codes), startAddr, 0, &insn);
     if (count > 0) {
         for (size_t j=0; j<count && j<num; j++) {
-            instrs.push_back(Instruction(
-                insn[j].address,
-                insn[j].bytes,
-                insn[j].size,
-                insn[j].mnemonic,
-                insn[j].op_str
-            ));
+            if (StartAddress <= insn[j].address && insn[j].address <= EndAddress) {
+                instrs.push_back(Instruction(
+                    insn[j].address,
+                    insn[j].bytes,
+                    insn[j].size,
+                    insn[j].mnemonic,
+                    insn[j].op_str
+                ));
+            }
         }
         cs_free(insn, count);
     }
@@ -239,21 +245,42 @@ void CMD_loadProgram(State &state, char *progName) {
         fprintf(stderr, "** state must be NOT LOADED\n");
         return;
     }
-    Elf64_Ehdr header;
-    FILE *file = fopen(progName, "rb");
-    if (file == NULL) {
-        fprintf(stderr, "** '%s' no such file or directory\n", progName);
-        return;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "readelf -S %s", progName);
+    FILE* fp = popen(cmd, "r");
+    char output[512];
+    unsigned long textStart = 0;
+    unsigned long textSize = 0;
+    char text[] = ".text";
+    bool findtext = false;
+    while (fgets(output, sizeof(output), fp) != NULL) {
+        int nargs = 0;
+        char *token, *saveptr, *args[10], *ptr = output;
+        while (nargs < 10 && (token = strtok_r(ptr, " \t\n[]", &saveptr)) != NULL) {
+            args[nargs++] = token;
+            ptr = NULL;
+        }
+        if (findtext) {
+            if (0 < nargs) {
+                textSize = strtoul(args[0], NULL, 16);
+            }
+            break;
+        }
+        for (int i=0;i<nargs;i++) {
+            if (strcmp(args[i], text) == 0 && i+2 < nargs) {
+                findtext = true;
+                textStart = strtoul(args[i+2], NULL, 16);
+                break;
+            }
+        }
     }
-    fread(&header, sizeof(header), 1, file);
-    if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0) {
-        fprintf(stderr, "** program '%s' is not ELF file\n", progName);
-        fclose(file);
-        return;
+    if (textStart != 0 && textSize != 0) {
+        StartAddress = textStart;
+        EndAddress = textStart + textSize - 1;
+        state = State::LOADED;
+        fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, StartAddress);
     }
-    fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, header.e_entry);
-    state = State::LOADED;
-    fclose(file);
+    pclose(fp);
 }
 
 void CMD_getRegs(pid_t pid, State &state) {
@@ -364,9 +391,11 @@ void CMD_createBreakPoint(pid_t pid, State &state, char *address) {
         fprintf(stderr, "** state must be RUNNING\n");
         return;
     }
-    // check text range
-
     unsigned long addressVal = strtoul(address, NULL, 16);
+    if (!(StartAddress <= addressVal && addressVal <= EndAddress)) {
+        fprintf(stderr, "** the address is out of the range of the text segment\n");
+        return;
+    }
     auto it = std::find_if(breakpoints.begin(), breakpoints.end(), [addressVal](const BPinfo &b) {
         return b.address == addressVal;
     });
@@ -413,6 +442,9 @@ void CMD_disAssembly(pid_t pid, State &state, char *address) {
     std::vector<Instruction> instrs;
     disAsmInstr(instrs, pid, addressVal, 10);
     printInstr(instrs);
+    if (instrs.size() < 10) {
+        fprintf(stderr, "** the address is out of the range of the text segment\n");
+    }
 }
 
 char* getCmd(char *cmd, FILE *filein) {
