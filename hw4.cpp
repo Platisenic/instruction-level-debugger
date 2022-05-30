@@ -18,99 +18,9 @@
 
 #include "putils.h"
 
-enum class State {
-    NOT_LOADED,
-    LOADED,
-    RUNNING
-};
-
-class BPinfo {
-public:
-    unsigned long address;
-    unsigned long oriByte;
-    BPinfo():
-        address(0), oriByte(0) {
-    }
-    BPinfo(unsigned long address, unsigned long oriByte):
-        address(address), oriByte(oriByte) {
-    }
-};
-
-class Instruction {
-public:
-    unsigned long address;
-    unsigned char bytes[16];
-    int size;
-    std::string mnemonic;
-    std::string op_str;
-    Instruction(
-        unsigned long address,
-        unsigned char* bytesptr,
-        int size,
-        char *mnemonic,
-        char *op_str
-    ): address(address), size(size), mnemonic(mnemonic), op_str(op_str) {
-        memcpy(bytes, bytesptr, size);
-    }
-};
-
 std::vector<BPinfo> breakpoints;
+AddressRange textsection;
 unsigned long lastBpAddress = 0;
-unsigned long StartAddress = 0;
-unsigned long EndAddress = 0;
-
-void printInstr(std::vector<Instruction> &instrs) {
-    char bytes[128] = "";
-    for (auto it=instrs.begin(); it!=instrs.end(); it++) {
-        for(int i=0; i<it->size; i++) {
-            snprintf(&bytes[i*3], 4, "%02x ", it->bytes[i]);
-        }
-        fprintf(stderr, "%12lx: %-32s\t%-10s%s\n", it->address, bytes, it->mnemonic.c_str(), it->op_str.c_str());
-    }
-}
-
-void disAsmInstr(std::vector<Instruction> &instrs, pid_t pid, unsigned long startAddr, int num)  {
-    char codes[256] = { 0 };
-    unsigned long peek, offset;
-    // peek
-    for (int i=0; i<num*2; i++) {
-        // todo check text ranges
-        if (StartAddress <= (startAddr+i*8) && (startAddr+i*8) <= EndAddress) {
-            errno = 0;
-            peek = ptrace(PTRACE_PEEKTEXT, pid, startAddr+i*8, NULL);
-            if (errno != 0) { break; }
-            memcpy(&codes[i*8], &peek, sizeof(peek));
-            // clear brackpoints
-            for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
-                if ((startAddr+i*8) <= it->address && it->address < (startAddr+i*8+8)) {
-                    offset = it->address - (startAddr+i*8);
-                    codes[i*8+offset] = it->oriByte;
-                }
-            }
-        }
-    }
-    // disassembly
-    csh handle;
-    cs_insn *insn;
-    size_t count;
-    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) { return; }
-    count = cs_disasm(handle, (uint8_t*)codes, sizeof(codes), startAddr, 0, &insn);
-    if (count > 0) {
-        for (size_t j=0; j<count && j<num; j++) {
-            if (StartAddress <= insn[j].address && insn[j].address <= EndAddress) {
-                instrs.push_back(Instruction(
-                    insn[j].address,
-                    insn[j].bytes,
-                    insn[j].size,
-                    insn[j].mnemonic,
-                    insn[j].op_str
-                ));
-            }
-        }
-        cs_free(insn, count);
-    }
-    cs_close(&handle);
-}
 
 pid_t CMD_startTracee(char *progName, State &state) {
     if (state != State::LOADED) {
@@ -183,7 +93,7 @@ void CMD_stepTracee(pid_t pid, State &state) {
         setReg(pid, "rip", rip-1);
         lastBpAddress = it->address;
         std::vector<Instruction> instrs;
-        disAsmInstr(instrs, pid, it->address, 1);
+        disAsmInstr(instrs, breakpoints, textsection, pid, it->address, 1);
         fprintf(stderr, "** breakpoint @");
         printInstr(instrs);
     }
@@ -222,7 +132,7 @@ void CMD_contTracee(pid_t pid, State &state) {
         setReg(pid, "rip", rip-1);
         lastBpAddress = it->address;
         std::vector<Instruction> instrs;
-        disAsmInstr(instrs, pid, it->address, 1);
+        disAsmInstr(instrs, breakpoints, textsection, pid, it->address, 1);
         fprintf(stderr, "** breakpoint @");
         printInstr(instrs);   
     }
@@ -275,10 +185,10 @@ void CMD_loadProgram(State &state, char *progName) {
         }
     }
     if (textStart != 0 && textSize != 0) {
-        StartAddress = textStart;
-        EndAddress = textStart + textSize - 1;
+        textsection.start = textStart;
+        textsection.end = textStart + textSize - 1;
         state = State::LOADED;
-        fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, StartAddress);
+        fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, textStart);
     }
     pclose(fp);
 }
@@ -392,7 +302,7 @@ void CMD_createBreakPoint(pid_t pid, State &state, char *address) {
         return;
     }
     unsigned long addressVal = strtoul(address, NULL, 16);
-    if (!(StartAddress <= addressVal && addressVal <= EndAddress)) {
+    if (!textsection.checkRange(addressVal)) {
         fprintf(stderr, "** the address is out of the range of the text segment\n");
         return;
     }
@@ -440,7 +350,7 @@ void CMD_disAssembly(pid_t pid, State &state, char *address) {
     }
     unsigned long addressVal = strtoul(address, NULL, 16);
     std::vector<Instruction> instrs;
-    disAsmInstr(instrs, pid, addressVal, 10);
+    disAsmInstr(instrs, breakpoints, textsection, pid, addressVal, 10);
     printInstr(instrs);
     if (instrs.size() < 10) {
         fprintf(stderr, "** the address is out of the range of the text segment\n");

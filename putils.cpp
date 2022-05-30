@@ -1,5 +1,7 @@
-#include "putils.h"
+#include <string.h>
+#include <capstone/capstone.h>
 
+#include "putils.h"
 struct user_regs_struct __regs;
 std::map<std::string, long int> regoffsets {
     {"rax",   ((unsigned char *) &__regs.rax)    - ((unsigned char *) &__regs)},
@@ -58,4 +60,62 @@ bool patch_clearBreakpoint(pid_t pid, unsigned long addressVal, unsigned long or
         return false;
     }
     return true;
+}
+
+void printInstr(std::vector<Instruction> &instrs) {
+    char bytes[128] = "";
+    for (auto it=instrs.begin(); it!=instrs.end(); it++) {
+        for(int i=0; i<it->size; i++) {
+            snprintf(&bytes[i*3], 4, "%02x ", it->bytes[i]);
+        }
+        fprintf(stderr, "%12lx: %-32s\t%-10s%s\n", it->address, bytes, it->mnemonic.c_str(), it->op_str.c_str());
+    }
+}
+
+void disAsmInstr(
+        std::vector<Instruction> &instrs,
+        std::vector<BPinfo> &breakpoints,
+        AddressRange &textsection,
+        pid_t pid,
+        unsigned long startAddr,
+        int num) {
+    char codes[256] = { 0 };
+    unsigned long peek, offset;
+    // peek
+    for (int i=0; i<num*2; i++) {
+        if (textsection.checkRange(startAddr+i*8)) {
+            errno = 0;
+            peek = ptrace(PTRACE_PEEKTEXT, pid, startAddr+i*8, NULL);
+            if (errno != 0) { break; }
+            memcpy(&codes[i*8], &peek, sizeof(peek));
+            // clear brackpoints
+            for (auto it = breakpoints.begin(); it != breakpoints.end(); it++) {
+                if ((startAddr+i*8) <= it->address && it->address < (startAddr+i*8+8)) {
+                    offset = it->address - (startAddr+i*8);
+                    codes[i*8+offset] = it->oriByte;
+                }
+            }
+        }
+    }
+    // disassembly
+    csh handle;
+    cs_insn *insn;
+    size_t count;
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) { return; }
+    count = cs_disasm(handle, (uint8_t*)codes, sizeof(codes), startAddr, 0, &insn);
+    if (count > 0) {
+        for (size_t j=0; j<count && j<num; j++) {
+            if (textsection.checkRange(insn[j].address)) {
+                instrs.push_back(Instruction(
+                    insn[j].address,
+                    insn[j].bytes,
+                    insn[j].size,
+                    insn[j].mnemonic,
+                    insn[j].op_str
+                ));
+            }
+        }
+        cs_free(insn, count);
+    }
+    cs_close(&handle);
 }
