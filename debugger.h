@@ -11,10 +11,10 @@ class Debugger {
 public:
     Debugger():
         m_state(State::NOT_LOADED),
-        m_lastBPAddress(0),
         m_tracee(-1) {
     }
     void CMD_startTracee(char *progName);
+    void Handle_breakpoints();
     void CMD_stepTracee();
     void CMD_contTracee();
     void CMD_runTracee(char *progName);
@@ -34,6 +34,5 @@ private:
     State m_state;
     AddressRange m_textsection;
     std::vector<BPinfo> m_breakpoints;
-    unsigned long m_lastBPAddress;
     pid_t m_tracee;
 };

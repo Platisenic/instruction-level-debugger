@@ -61,6 +61,7 @@ public:
     }
 };
 
+bool check_cc(pid_t pid, unsigned long addressVal);
 char* getCmd(char *cmd, FILE *filein);
 bool getReg(pid_t pid, std::string regName, unsigned long &regVal);
 bool setReg(pid_t pid, std::string regName, unsigned long regVal);

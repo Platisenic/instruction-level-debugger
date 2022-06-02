@@ -62,6 +62,11 @@ bool patch_clearBreakpoint(pid_t pid, unsigned long addressVal, unsigned long or
     return true;
 }
 
+bool check_cc(pid_t pid, unsigned long addressVal) {
+    unsigned long code = ptrace(PTRACE_PEEKTEXT, pid, addressVal, 0);
+    return (code & 0xff) == 0xcc;
+}
+
 void printInstr(std::vector<Instruction> &instrs) {
     char bytes[128] = "";
     for (auto it=instrs.begin(); it!=instrs.end(); it++) {

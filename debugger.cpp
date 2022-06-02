@@ -36,12 +36,18 @@ void Debugger::CMD_startTracee(char *progName) {
     m_tracee = child;
 }
 
-void Debugger::CMD_stepTracee() {
-    if (m_state != State::RUNNING) {
-        fprintf(stderr, "** state must be RUNNING\n");
-        return;
-    }
+void Debugger::Handle_breakpoints() {
+    unsigned long rip;
     int wait_status;
+    getReg(m_tracee, "rip", rip);
+    auto it = std::find_if(m_breakpoints.begin(), m_breakpoints.end(), [rip](const BPinfo &b) {
+        return b.address == rip;
+    });
+    if (it == m_breakpoints.end()) { return; }
+
+    patch_clearBreakpoint(m_tracee, it->address, it->oriByte);
+    
+
     if(ptrace(PTRACE_SINGLESTEP, m_tracee, 0, 0) < 0) {
         perror("** singlestep");
         return;
@@ -52,47 +58,21 @@ void Debugger::CMD_stepTracee() {
             m_tracee, WEXITSTATUS(wait_status));
         m_state = State::LOADED;
     } else if (WIFSTOPPED(wait_status)) {
-        unsigned long address = m_lastBPAddress;
-        auto it = std::find_if(m_breakpoints.begin(), m_breakpoints.end(), [address](const BPinfo &b) {
-            return b.address == address;
-        });
-        if (it != m_breakpoints.end()) {
-            patch_setBreakpoint(m_tracee, it->address, NULL);
-        }
-        m_lastBPAddress = 0;
-        unsigned long rip;
-        getReg(m_tracee, "rip", rip);
-        it = std::find_if(m_breakpoints.begin(), m_breakpoints.end(), [rip](const BPinfo &b) {
-            return b.address == (rip - 1);
-        });
-        if (it == m_breakpoints.end()) { return; }
-        // hit breakpoint
-        patch_clearBreakpoint(m_tracee, it->address, it->oriByte);
-        setReg(m_tracee, "rip", rip-1);
-        m_lastBPAddress = it->address;
-        std::vector<Instruction> instrs;
-        disAsmInstr(instrs, m_breakpoints, m_textsection, m_tracee, it->address, 1);
-        fprintf(stderr, "** breakpoint @");
-        printInstr(instrs);
+        patch_setBreakpoint(m_tracee, it->address, NULL);
     }
 }
 
-void Debugger::CMD_contTracee() {
+void Debugger::CMD_stepTracee() {
     if (m_state != State::RUNNING) {
         fprintf(stderr, "** state must be RUNNING\n");
         return;
     }
-    if (m_lastBPAddress != 0) {
-        CMD_stepTracee();
-        if (m_lastBPAddress != 0) { // encounter breakpoints in stepTracee
-            return;
-        }
-    }
-    int wait_status;
-    if(ptrace(PTRACE_CONT, m_tracee, 0, 0) < 0) {
-        perror("** cont");
+    Handle_breakpoints();
+    if(ptrace(PTRACE_SINGLESTEP, m_tracee, 0, 0) < 0) {
+        perror("** singlestep");
         return;
     }
+    int wait_status;
     waitpid(m_tracee, &wait_status, 0);
     if (WIFEXITED(wait_status)) {
         fprintf(stderr, "** child process %d terminiated normally (code %d)\n",
@@ -101,18 +81,44 @@ void Debugger::CMD_contTracee() {
     } else if (WIFSTOPPED(wait_status)) {
         unsigned long rip;
         getReg(m_tracee, "rip", rip);
-        auto it = std::find_if(m_breakpoints.begin(), m_breakpoints.end(), [rip](const BPinfo &b) {
-            return b.address == (rip - 1);
-        });
-        if (it == m_breakpoints.end()) { return; }
-        // hit breakpoint
-        patch_clearBreakpoint(m_tracee, it->address, it->oriByte);
-        setReg(m_tracee, "rip", rip-1);
-        m_lastBPAddress = it->address;
-        std::vector<Instruction> instrs;
-        disAsmInstr(instrs, m_breakpoints, m_textsection, m_tracee, it->address, 1);
-        fprintf(stderr, "** breakpoint @");
-        printInstr(instrs);   
+        if (check_cc(m_tracee, rip - 1)) {
+            setReg(m_tracee, "rip", rip - 1);
+            std::vector<Instruction> instrs;
+            disAsmInstr(instrs, m_breakpoints, m_textsection, m_tracee, rip-1, 1);
+            fprintf(stderr, "** breakpoint @");
+            printInstr(instrs);   
+        }
+    }
+}
+
+void Debugger::CMD_contTracee() {
+    if (m_state != State::RUNNING) {
+        fprintf(stderr, "** state must be RUNNING\n");
+        return;
+    }
+    Handle_breakpoints();
+    if(ptrace(PTRACE_CONT, m_tracee, 0, 0) < 0) {
+        perror("** cont");
+        return;
+    }
+    int wait_status;
+    waitpid(m_tracee, &wait_status, 0);
+    if (WIFEXITED(wait_status)) {
+        fprintf(stderr, "** child process %d terminiated normally (code %d)\n",
+            m_tracee, WEXITSTATUS(wait_status));
+        m_state = State::LOADED;
+    } else if (WIFSTOPPED(wait_status)) {
+        unsigned long rip;
+        getReg(m_tracee, "rip", rip);
+        if (check_cc(m_tracee, rip - 1)) {
+            setReg(m_tracee, "rip", rip - 1);
+            std::vector<Instruction> instrs;
+            disAsmInstr(instrs, m_breakpoints, m_textsection, m_tracee, rip - 1, 1);
+            fprintf(stderr, "** breakpoint @");
+            printInstr(instrs);   
+        }
+
+        
     }
 }
 
@@ -232,7 +238,7 @@ void Debugger::CMD_dump(char *address) {
     memset(strbuf, 0, 17);
 
     for (int i=0;i<10;i++) {
-        if (i%2==0) { fprintf(stderr, "0x%12lx:", addressVal + i*8); }
+        if (i%2==0) { fprintf(stderr, "%12lx:", addressVal + i*8); }
         ret = ptrace(PTRACE_PEEKTEXT, m_tracee, addressVal + i*8, 0);
         for (int j=0;j<8;j++) {
             fprintf(stderr, " %2.2x", ptr[j]);

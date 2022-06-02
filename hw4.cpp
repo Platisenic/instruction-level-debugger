@@ -109,7 +109,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "** undefined command\n");
         }
     }
-    
+
     fclose(filein);
     return 0;
 }
