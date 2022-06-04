@@ -1,4 +1,5 @@
 #include "debugger.h"
+#include <elf.h>
 
 void Debugger::CMD_startTracee(char *progName) {
     if (m_state != State::LOADED) {
@@ -139,44 +140,43 @@ void Debugger::CMD_loadProgram(char *progName) {
         fprintf(stderr, "** state must be NOT LOADED\n");
         return;
     }
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "readelf -S %s 2>&1", progName);
-    FILE* fp = popen(cmd, "r");
-    char output[512];
-    unsigned long textStart = 0;
-    unsigned long textSize = 0;
-    char text[] = ".text";
-    bool findtext = false;
-    while (fgets(output, sizeof(output), fp) != NULL) {
-        int nargs = 0;
-        char *token, *saveptr, *args[10], *ptr = output;
-        while (nargs < 10 && (token = strtok_r(ptr, " \t\n[]", &saveptr)) != NULL) {
-            args[nargs++] = token;
-            ptr = NULL;
+    Elf64_Ehdr header;
+    FILE *file = fopen(progName, "rb");
+    if (file == NULL) {
+        fprintf(stderr, "** '%s' no such file or directory\n", progName);
+        exit(1);
+    }
+    fread(&header, sizeof(header), 1, file);
+    if (memcmp(header.e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, "** program '%s' is not ELF file\n", progName);
+        exit(1);
+    }
+    Elf64_Shdr *sectionHeaders = (Elf64_Shdr *)calloc(header.e_shnum, header.e_shentsize);
+    if (sectionHeaders == NULL) { exit(1);}
+    fseek(file, header.e_shoff, SEEK_SET);
+    fread(sectionHeaders, header.e_shentsize, header.e_shnum, file);
+    char sectionName[256];
+    char c;
+    int k;
+    for(int i=0;i<header.e_shnum;i++) {
+        fseek(file, sectionHeaders[header.e_shstrndx].sh_offset+sectionHeaders[i].sh_name, SEEK_SET);
+        k = 0;
+        while((c = fgetc(file)) != '\0') {
+            sectionName[k++] = c;
         }
-        if (findtext) {
-            if (0 < nargs) {
-                textSize = strtoul(args[0], NULL, 16);
-            }
+        sectionName[k] = '\0';
+        // fprintf(stderr, "** name: %s adderss: %lx size: %lx\n", sectionName, sectionHeaders[i].sh_addr, sectionHeaders[i].sh_size);
+        if (strcmp(sectionName, ".text") == 0) {
+            m_textsection.start = sectionHeaders[i].sh_addr;
+            m_textsection.end = sectionHeaders[i].sh_addr + sectionHeaders[i].sh_size - 1;
             break;
         }
-        for (int i=0;i<nargs;i++) {
-            if (strcmp(args[i], text) == 0 && i+2 < nargs) {
-                findtext = true;
-                textStart = strtoul(args[i+2], NULL, 16);
-                break;
-            }
-        }
     }
-    if (!(textStart != 0 && textSize != 0)) {
-        fprintf(stderr, "** No such file or directory\n");
-        exit(1);
-    } 
-    m_textsection.start = textStart;
-    m_textsection.end = textStart + textSize - 1;
+    free(sectionHeaders);
+    fclose(file);
+    if ((m_textsection.start == 0) && (m_textsection.end) == 0) { exit(1); }
+    fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, m_textsection.start);
     m_state = State::LOADED;
-    fprintf(stderr, "** program '%s' loaded. entry point 0x%lx\n", progName, textStart);
-    pclose(fp);
 }
 
 void Debugger::CMD_getRegs() {
