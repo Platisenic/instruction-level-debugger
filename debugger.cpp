@@ -47,7 +47,6 @@ void Debugger::Handle_breakpoints() {
     if (it == m_breakpoints.end()) { return; }
 
     patch_clearBreakpoint(m_tracee, it->address, it->oriByte);
-    
 
     if(ptrace(PTRACE_SINGLESTEP, m_tracee, 0, 0) < 0) {
         perror("** singlestep");
@@ -87,7 +86,7 @@ void Debugger::CMD_stepTracee() {
             std::vector<Instruction> instrs;
             disAsmInstr(instrs, m_breakpoints, m_textsection, m_tracee, rip-1, 1);
             fprintf(stderr, "** breakpoint @");
-            printInstr(instrs);   
+            printInstr(instrs);
         }
     }
 }
@@ -116,10 +115,8 @@ void Debugger::CMD_contTracee() {
             std::vector<Instruction> instrs;
             disAsmInstr(instrs, m_breakpoints, m_textsection, m_tracee, rip - 1, 1);
             fprintf(stderr, "** breakpoint @");
-            printInstr(instrs);   
+            printInstr(instrs);
         }
-
-        
     }
 }
 
@@ -258,7 +255,7 @@ void Debugger::CMD_vmmap() {
     char buf[512];
     char mmap_path[128];
     FILE *fp;
-    long vm_begin, vm_end, offset;
+    unsigned long vm_begin, vm_end, offset;
 
     snprintf(mmap_path, sizeof(mmap_path), "/proc/%u/maps", m_tracee);
     if ((fp = fopen(mmap_path, "rt")) == NULL) { perror("** fopen"); return; }
@@ -269,13 +266,12 @@ void Debugger::CMD_vmmap() {
             args[nargs++] = token;
             ptr = NULL;
         }
-        if (nargs < 6) continue;
+        if (nargs < 6) { continue; }
         if ((ptr = strchr(args[0], '-')) == NULL) { continue; }
         *ptr = '\0';
-        vm_begin = strtol(args[0], NULL, 16);
-        vm_end = strtol(ptr+1, NULL, 16);
-    
-        offset = strtol(args[2], NULL, 16);
+        vm_begin = strtoul(args[0], NULL, 16);
+        vm_end = strtoul(ptr+1, NULL, 16);
+        offset = strtoul(args[2], NULL, 16);
         if (strlen(args[1]) < 4) { continue; }
         args[1][3] = '\0';
         fprintf(stderr, "%016lx-%016lx %s %-8lx %s\n", vm_begin, vm_end, args[1], offset, args[5]);
@@ -344,7 +340,7 @@ void Debugger::CMD_disAssembly(char *address) {
 }
 
 void Debugger::CMD_printHelpMsg() {
-    fprintf(stderr, 
+    fprintf(stderr,
         "- break {instruction-address}: add a break point\n"
         "- cont: continue execution\n"
         "- delete {break-point-id}: remove a break point\n"
