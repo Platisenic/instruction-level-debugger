@@ -130,3 +130,4 @@ char* getCmd(char *cmd, FILE *filein) {
     }
     return fgets(cmd, 512, filein);
 }
+

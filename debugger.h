@@ -11,11 +11,11 @@ class Debugger {
 public:
     Debugger():
         m_state(State::NOT_LOADED),
-        m_tracee(-1) {
+        m_tracee(-1),
+        m_hit_breakpoint(0){
     }
     void CMD_startTracee(char *progName);
-    void Handle_breakpoints();
-    void CMD_stepTracee();
+    bool CMD_stepTracee();
     void CMD_contTracee();
     void CMD_runTracee(char *progName);
     void CMD_loadProgram(char *progName);
@@ -35,4 +35,6 @@ private:
     AddressRange m_textsection;
     std::vector<BPinfo> m_breakpoints;
     pid_t m_tracee;
+    unsigned long m_hit_breakpoint;
 };
+
